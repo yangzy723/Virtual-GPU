@@ -3,6 +3,8 @@
 
 #include "list.h"
 
+#include <stdint.h>
+
 typedef struct kernel_info {
     char *name;
     size_t param_size;

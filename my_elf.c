@@ -1,8 +1,6 @@
 #include "my_elf.h"
 #include "util.h"
 
-#include <libelf.h>
-#include <gelf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>

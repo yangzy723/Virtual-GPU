@@ -4,9 +4,7 @@
 #include <dlfcn.h>
 #include <string.h>
 
-list kernel_infos;
-
-static kernel_info_t* utils_search_info(list *_kernel_infos, const char *kernelname)
+kernel_info_t* utils_search_info(list *_kernel_infos, const char *kernelname)
 {
     kernel_info_t *info = NULL;
     if (_kernel_infos == NULL) {
@@ -25,7 +23,7 @@ static kernel_info_t* utils_search_info(list *_kernel_infos, const char *kerneln
     return NULL;
 }
 
-static void *get_sym(const char *name) {
+void *get_sym(const char *name) {
     void *p = dlsym(RTLD_NEXT, name);
     if (p) return p;
 
@@ -49,7 +47,7 @@ static void *get_sym(const char *name) {
     return NULL;
 }
 
-static void hexdump(const uint8_t* data, size_t size)
+void hexdump(const uint8_t* data, size_t size)
 {
     size_t pos = 0;
     while (pos < size) {

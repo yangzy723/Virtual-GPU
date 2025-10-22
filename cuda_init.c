@@ -1,20 +1,27 @@
-#include <stdio.h>
-#include <string.h>
 #include <dlfcn.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include <cuda.h>
+#include <cuda_runtime.h>
 
 #include "list.h"
 #include "util.h"
+#include "my_elf.h"
 #include "resource-mg.h"
 
-int cnt = 0;
+typedef CUresult (*orig___cuModuleLoadData_t)(CUmodule *module, const void *image);
 
-typedef void **(*orig___cuModuleLoadData_t)(CUmodule module, const void *fatCubin);
+int cnt = 0;
+list kernel_infos;
+static orig___cuModuleLoadData_t orig_cuModuleLoadData = NULL;
 void **__cudaRegisterFatBinary(void *fatCubin)
 {
     cnt++;
     printf("__cudaRegisterFatBinary(fatCubin=%p), called %d times\n", fatCubin, cnt);
 
-    void **result = NULL;
     uint8_t *fatbin_data = NULL;
     size_t fatbin_size = 0;
 
@@ -23,8 +30,8 @@ void **__cudaRegisterFatBinary(void *fatCubin)
         return NULL;
     }
 
-
-    static orig___cuModuleLoadData_t orig_cuModuleLoadData = get_sym("cuModuleLoadData");
+    if (orig_cuModuleLoadData == NULL)
+        orig_cuModuleLoadData = get_sym("cuModuleLoadData");
     CUmodule module;
     void **result = (void**)calloc(1, 0x58);
     orig_cuModuleLoadData(&module, fatbin_data);
@@ -44,7 +51,7 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
     } else {
         printf("request to register known function: \"%s\"", deviceName);
         CUfunction f;
-        CUmodule module = resource_mg_get(&rm_modules, (void *)fatCubinHandle)
+        CUmodule module = resource_mg_get(&rm_modules, (void *)fatCubinHandle);
         cuModuleGetFunction(&f, module, deviceName);
         resource_mg_add_sorted(&rm_functions, (void *)hostFun, (void *)(&f));
         info->host_fun = (void *)hostFun;

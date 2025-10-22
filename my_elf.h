@@ -1,7 +1,11 @@
 #ifndef ELF2_H
 #define ELF2_H
 
-#include <list.h>
+#include "list.h"
+#include "util.h"
+
+#include <gelf.h>
+#include <libelf.h>
 
 struct __attribute__((__packed__)) fat_header {
     uint32_t magic;
