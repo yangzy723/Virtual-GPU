@@ -3,6 +3,9 @@
 
 #include <stdio.h>
 
+resource_mg rm_modules;
+resource_mg rm_functions;
+
 int resource_mg_init(resource_mg *mg, int bypass)
 {
     int ret = 0;

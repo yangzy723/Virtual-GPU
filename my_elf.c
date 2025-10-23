@@ -1,118 +1,99 @@
 #include "my_elf.h"
 #include "util.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 
-int elf2_get_fatbin_info(const struct fat_header *fatbin, list *kernel_infos, uint8_t** fatbin_mem, size_t* fatbin_size)
+#define FATBIN_FLAG_64BIT     0x0000000000000001LL
+#define FATBIN_FLAG_DEBUG     0x0000000000000002LL
+#define FATBIN_FLAG_LINUX     0x0000000000000010LL
+#define FATBIN_FLAG_COMPRESS  0x0000000000002000LL
+
+#define FATBIN_STRUCT_MAGIC 0x466243b1
+#define FATBIN_TEXT_MAGIC   0xBA55ED50
+
+#define EIFMT_SVAL 4
+#define EIFMT_HVAL 3
+#define EIFMT_NVAL 1
+
+#define EIATTR_PARAM_CBANK 10
+#define EIATTR_CBANK_PARAM_SIZE 25
+#define EIATTR_KPARAM_INFO 23
+#define EIATTR_MAXREG_COUNT 27
+#define EIATTR_S2RCTAID_INSTR_OFFSETS 29
+#define EIATTR_EXIT_INSTR_OFFSETS 28
+#define EIATTR_EXTERNS 15
+#define EIATTR_CRS_STACK_SIZE 30
+#define EIATTR_MAX_STACK_SIZE 35
+#define EIATTR_MIN_STACK_SIZE 18 // maximal size of the stack when calling this kernel
+#define EIATTR_FRAME_SIZE 17 // size of stack in this function (without subcall)
+
+static int flag_to_str(char** str, uint64_t flag)
 {
-    struct fat_elf_header* eh;
-    struct fat_text_header* th;
-    const uint8_t *input_pos = NULL;
-    const uint8_t *fatbin_data = NULL;
-    uint8_t *text_data = NULL;
-    size_t text_data_size = 0;
-    size_t fatbin_total_size = 0;
-    int ret = -1;
-    if (fatbin == NULL || fatbin_mem == NULL || fatbin_size == NULL) {
-        printf("at least one parameter is NULL\n");
-        goto error;
-    }
-    fatbin_data = input_pos = (const uint8_t*)fatbin->text;
-    if (fatbin->magic != FATBIN_STRUCT_MAGIC) {
-        printf("fatbin struct magic number is wrong. Got %llx, expected %llx.\n", fatbin->magic, FATBIN_STRUCT_MAGIC);
-        goto error;
-    }
-    printf("Fatbin: magic: %x, version: %x, text: %lx, data: %lx, ptr: %lx, ptr2: %lx, zero: %lx\n",
-           fatbin->magic, fatbin->version, fatbin->text, fatbin->data, fatbin->unknown, fatbin->text2, fatbin->zero);
-
-    if (get_elf_header((uint8_t*)fatbin->text, sizeof(struct fat_elf_header), &eh) != 0) {
-        printf("Something went wrong while checking the header.\n");
-        goto error;
-    }
-    printf("elf header: magic: %#x, version: %#x, header_size: %#x, size: %#zx\n",
-           eh->magic, eh->version, eh->header_size, eh->size); 
-
-    input_pos += eh->header_size;
-    fatbin_total_size = eh->header_size + eh->size;
-    do {
-        if (get_text_header(input_pos, *fatbin_size - (input_pos - fatbin_data) - eh->header_size, &th) != 0) {
-            printf("Something went wrong while checking the header.\n");
-            goto error;
-        }
-        //print_header(th);
-        input_pos += th->header_size;
-        if (th->kind != 2) { // section does not cotain device code (but e.g. PTX)
-            input_pos += th->size;
-            continue;
-        }
-        if (th->flags & FATBIN_FLAG_DEBUG) {
-            printf("fatbin contains debug information.\n");
-        }
-
-        if (th->flags & FATBIN_FLAG_COMPRESS) {
-            ssize_t input_read;
-
-            printf("fatbin contains compressed device code. Decompressing...\n");
-            if ((input_read = decompress_single_section(input_pos, &text_data, &text_data_size, eh, th)) < 0) {
-                printf("Something went wrong while decompressing text section.\n");
-                goto error;
-            }
-            input_pos += input_read;
-            //hexdump(text_data, text_data_size);
-        } else {
-            text_data = (uint8_t*)input_pos;
-            text_data_size = th->size;
-            input_pos += th->size;
-        }
-        // print_header(th);
-        if (elf2_parameter_info(kernel_infos, text_data , text_data_size) != 0) {
-            printf("error getting parameter info\n");
-            goto error;
-        }
-        if (th->flags & FATBIN_FLAG_COMPRESS) {
-            free(text_data);
-        }
-    } while (input_pos < (uint8_t*)eh + eh->header_size + eh->size);
-
-    // if (get_elf_header((uint8_t*)fatbin->text2, sizeof(struct fat_elf_header), &eh) != 0) {
-    //     LOGE(LOG_ERROR, "Something went wrong while checking the header.");
-    //     goto error;
-    // }
-    // fatbin_total_size += eh->header_size + eh->size;
-
-    *fatbin_mem = (void*)fatbin->text;
-    *fatbin_size = fatbin_total_size;
-    ret = 0;
- error:
-    return ret;
+    return asprintf(str, "64Bit: %s, Debug: %s, Linux: %s, Compress %s",
+        (flag & FATBIN_FLAG_64BIT) ? "yes" : "no",
+        (flag & FATBIN_FLAG_DEBUG) ? "yes" : "no",
+        (flag & FATBIN_FLAG_LINUX) ? "yes" : "no",
+        (flag & FATBIN_FLAG_COMPRESS) ? "yes" : "no");
 }
 
+static void print_header(struct fat_text_header *th)
+{
+    char* flagstr = NULL;
+    flag_to_str(&flagstr, th->flags);
+
+    LOGE(LOG_DBG(1), "text_header: fatbin_kind: %#x, header_size %#x, size %#zx, compressed_size %#x,\
+ minor %#x, major %#x, arch %d, decompressed_size %#zx\n\tflags: %s\n",
+        th->kind,
+        th->header_size,
+        th->size,
+        th->compressed_size,
+        th->minor,
+        th->major,
+        th->arch,
+        th->decompressed_size,
+        flagstr);
+    LOGE(LOG_DBG(1), "\tunknown fields: unknown1: %#x, unknown2: %#x, zeros: %#zx\n",
+        th->unknown1,
+        th->unknown2,
+        th->zero);
+
+    free(flagstr);
+}
+
+/** Check the header of a fatbin
+ * Performs some integrity checks and returns the elf header
+ * @param fatbin_data Pointer to the fatbin data
+ * @param fatbin_size Size of the fatbin data
+ * @param decompressed_size Pointer to a variable that will be set to the size of the decompressed data
+ * @param compressed_data Pointer to a variable that will be set to point to the compressed data
+*/
 static int get_elf_header(const uint8_t* fatbin_data, size_t fatbin_size, struct fat_elf_header **elf_header)
 {
     struct fat_elf_header *eh = NULL;
 
     if (fatbin_data == NULL || elf_header == NULL) {
-        printf("fatbin_data is NULL\n");
+        LOGE(LOG_ERROR, "fatbin_data is NULL");
         return 1;
     }
 
     if (fatbin_size < sizeof(struct fat_elf_header)) {
-        printf("fatbin_size is too small\n");
+        LOGE(LOG_ERROR, "fatbin_size is too small");
         return 1;
     }
 
     eh = (struct fat_elf_header*) fatbin_data;
     if (eh->magic != FATBIN_TEXT_MAGIC) {
-        printf("Invalid magic  number: expected %#x but got %#x\n", FATBIN_TEXT_MAGIC, eh->magic);
+        LOGE(LOG_ERROR, "Invalid magic  number: expected %#x but got %#x", FATBIN_TEXT_MAGIC, eh->magic);
         return 1;
     }
 
     if (eh->version != 1 || eh->header_size != sizeof(struct fat_elf_header)) {
-        printf("fatbin text version is wrong or header size is inconsistent.\
-            This is a sanity check to avoid reading a new fatbinary format\n");
+        LOGE(LOG_ERROR, "fatbin text version is wrong or header size is inconsistent.\
+            This is a sanity check to avoid reading a new fatbinary format");
         return 1;
     }
     
@@ -120,17 +101,24 @@ static int get_elf_header(const uint8_t* fatbin_data, size_t fatbin_size, struct
     return 0;
 }
 
+/** Check the text header of a fatbin
+ * Performs some integrity checks and returns the text header
+ * @param fatbin_data Pointer to the fatbin data
+ * @param fatbin_size Size of the fatbin data
+ * @param decompressed_size Pointer to a variable that will be set to the size of the decompressed data
+ * @param compressed_data Pointer to a variable that will be set to point to the compressed data
+*/
 static int get_text_header(const uint8_t* fatbin_data, size_t fatbin_size, struct fat_text_header **text_header)
 {
     struct fat_text_header *th = NULL;
 
     if (fatbin_data == NULL || text_header == NULL) {
-        printf("fatbin_data is NULL\n");
+        LOGE(LOG_ERROR, "fatbin_data is NULL");
         return 1;
     }
 
     if (fatbin_size < sizeof(struct fat_text_header)) {
-        printf("fatbin_size is too small\n");
+        LOGE(LOG_ERROR, "fatbin_size is too small");
         return 1;
     }
 
@@ -138,69 +126,15 @@ static int get_text_header(const uint8_t* fatbin_data, size_t fatbin_size, struc
 
     if(th->obj_name_offset != 0) {
         if (((char*)th)[th->obj_name_offset + th->obj_name_len] != '\0') {
-            printf("Fatbin object name is not null terminated\n");
+            LOGE(LOG_WARNING, "Fatbin object name is not null terminated");
         } else {
             char *obj_name = (char*)th + th->obj_name_offset;
-            printf("Fatbin object name: %s (len:%#x)\n", obj_name, th->obj_name_len);
+            LOGE(LOG_DEBUG, "Fatbin object name: %s (len:%#x)", obj_name, th->obj_name_len);
         }
     }
 
     *text_header = th;
     return 0;
-}
-
-static ssize_t decompress_single_section(const uint8_t *input, uint8_t **output, size_t *output_size,
-                                         struct fat_elf_header *eh, struct fat_text_header *th)
-{
-    size_t padding;
-    size_t input_read = 0;
-    size_t output_written = 0;
-    size_t decompress_ret = 0;
-    const uint8_t zeroes[8] = {0};
-
-    if (input == NULL || output == NULL || eh == NULL || th == NULL) {
-        printf("invalid parameters\n");
-        return 1;
-    }
-
-    // add max padding of 7 bytes
-    if ((*output = malloc(th->decompressed_size + 7)) == NULL) {
-        printf("Error allocating memory of size %#zx for output buffer: %s\n", th->decompressed_size, strerror(errno));
-        goto error;
-    }
-    print_header(th);
-
-    if ((decompress_ret = decompress(input, th->compressed_size, *output, th->decompressed_size)) != th->decompressed_size) {
-        printf("Decompression failed: decompressed size is %#zx, but header says %#zx\n", decompress_ret, th->decompressed_size);
-        printf("input pos: %#zx, output pos: %#zx\n", input - (uint8_t*)eh, *output);
-        hexdump(input, 0x160);
-        if (decompress_ret >= 0x60)
-            hexdump((*output) + decompress_ret - 0x60, 0x60);
-        goto error;
-    }
-    input_read += th->compressed_size;
-    output_written += th->decompressed_size;
-
-    padding = ((8 - (size_t)(input + input_read)) % 8);
-    if (memcmp(input + input_read, zeroes, padding) != 0) {
-        printf("expected %#zx zero bytes, got:\n", padding);
-        hexdump(input + input_read, 0x60);
-        goto error;
-    }
-    input_read += padding;
-
-    padding = ((8 - (size_t)th->decompressed_size) % 8);
-    // Because we always allocated enough memory for one more elf_header and this is smaller than
-    // the maximal padding of 7, we do not have to reallocate here.
-    memset(*output, 0, padding);
-    output_written += padding;
-
-    *output_size = output_written;
-    return input_read;
- error:
-    free(*output);
-    *output = NULL;
-    return -1;
 }
 
 /** Decompresses a fatbin file
@@ -226,7 +160,7 @@ static size_t decompress(const uint8_t* input, size_t input_size, uint8_t* outpu
         }
         
         if (memcpy(output + opos, input + (++ipos), next_nclen) == NULL) {
-            printf("copying data\n");
+            LOGE(LOG_ERROR, "copying data");
             return 0;
         }
 #ifdef FATBIN_DECOMPRESS_DEBUG
@@ -250,12 +184,12 @@ static size_t decompress(const uint8_t* input, size_t input_size, uint8_t* outpu
 #endif
         if (next_clen <= back_offset) {
             if (memcpy(output + opos, output + opos - back_offset, next_clen) == NULL) {
-                printf("Error copying data\n");
+                LOGE(LOG_ERROR, "Error copying data");
                 return 0;
             }
         } else {
             if (memcpy(output + opos, output + opos - back_offset, back_offset) == NULL) {
-                printf("Error copying data\n");
+                LOGE(LOG_ERROR, "Error copying data");
                 return 0;
             }
             for (size_t i = back_offset; i < next_clen; i++) {
@@ -267,161 +201,64 @@ static size_t decompress(const uint8_t* input, size_t input_size, uint8_t* outpu
 #endif
         opos += next_clen;
     }
-    printf("ipos: %#zx, opos: %#zx, ilen: %#zx, olen: %#zx\n", ipos, opos, input_size, output_size);
+    LOGE(LOG_DEBUG, "ipos: %#zx, opos: %#zx, ilen: %#zx, olen: %#zx", ipos, opos, input_size, output_size);
     return opos;
 }
 
-static void print_header(struct fat_text_header *th)
+static ssize_t decompress_single_section(const uint8_t *input, uint8_t **output, size_t *output_size,
+                                         struct fat_elf_header *eh, struct fat_text_header *th)
 {
-    printf("text_header: fatbin_kind: %#x, header_size %#x, size %#zx, compressed_size %#x,\
- minor %#x, major %#x, arch %d, decompressed_size %#zx\n\n",
-        th->kind,
-        th->header_size,
-        th->size,
-        th->compressed_size,
-        th->minor,
-        th->major,
-        th->arch,
-        th->decompressed_size);
-    printf("\tunknown fields: unknown1: %#x, unknown2: %#x, zeros: %#zx\n\n",
-        th->unknown1,
-        th->unknown2,
-        th->zero);
-}
+    size_t padding;
+    size_t input_read = 0;
+    size_t output_written = 0;
+    size_t decompress_ret = 0;
+    const uint8_t zeroes[8] = {0};
 
-int elf2_parameter_info(list *kernel_infos, void* memory, size_t memsize)
-{
-    struct __attribute__((__packed__)) nv_info_entry{
-        uint8_t format;
-        uint8_t attribute;
-        uint16_t values_size;
-        uint32_t kernel_id;
-        uint32_t value;
-    };
-
-    Elf *elf = NULL;
-    Elf_Scn *section = NULL;
-    Elf_Data *data = NULL, *symbol_table_data = NULL;
-    GElf_Shdr symtab_shdr;
-    size_t symnum;
-    int i = 0;
-    GElf_Sym sym;
-
-    int ret = -1;
-    kernel_info_t *ki = NULL;
-    const char *kernel_str;
-
-    if (memory == NULL || memsize == 0) {
-        printf("memory was NULL or memsize was 0\n");
-        return -1;
+    if (input == NULL || output == NULL || eh == NULL || th == NULL) {
+        LOGE(LOG_ERROR, "invalid parameters");
+        return 1;
     }
 
-// #define ELF_DUMP_TO_FILE 1
-
-#ifdef ELF_DUMP_TO_FILE
-    FILE* fd2 = fopen("/tmp/cricket-elf-dump", "wb");
-    fwrite(memory, memsize, 1, fd2);
-    fclose(fd2);
-#endif
-
-    if ((elf = elf_memory(memory, memsize)) == NULL) {
-        printf("elf_memory failed\n");
-        goto cleanup;
+    // add max padding of 7 bytes
+    if ((*output = malloc(th->decompressed_size + 7)) == NULL) {
+        LOGE(LOG_ERROR, "Error allocating memory of size %#zx for output buffer: %s", 
+                th->decompressed_size, strerror(errno));
+        goto error;
     }
+    print_header(th);
 
-    if (check_elf(elf) != 0) {
-        printf("check_elf failed\n");
-        goto cleanup;
+    if ((decompress_ret = decompress(input, th->compressed_size, *output, th->decompressed_size)) != th->decompressed_size) {
+        LOGE(LOG_ERROR, "Decompression failed: decompressed size is %#zx, but header says %#zx", 
+                decompress_ret, th->decompressed_size);
+        LOGE(LOG_ERROR, "input pos: %#zx, output pos: %#zx", input - (uint8_t*)eh, *output);
+        hexdump(input, 0x160);
+        if (decompress_ret >= 0x60)
+            hexdump((*output) + decompress_ret - 0x60, 0x60);
+        goto error;
     }
+    input_read += th->compressed_size;
+    output_written += th->decompressed_size;
 
-    if (get_symtab(elf, &symbol_table_data, &symnum, &symtab_shdr) != 0) {
-        printf("could not get symbol table\n");
-        goto cleanup;
+    padding = ((8 - (size_t)(input + input_read)) % 8);
+    if (memcmp(input + input_read, zeroes, padding) != 0) {
+        LOGE(LOG_ERROR, "expected %#zx zero bytes, got:", padding);
+        hexdump(input + input_read, 0x60);
+        goto error;
     }
+    input_read += padding;
 
-    if (get_section_by_name(elf, ".nv.info", &section) != 0) {
-        printf("could not find .nv.info section. This means this binary does not contain any kernels.\n");
-        ret = 0;    // This is not an error.
-        goto cleanup;
-    }
+    padding = ((8 - (size_t)th->decompressed_size) % 8);
+    // Because we always allocated enough memory for one more elf_header and this is smaller than
+    // the maximal padding of 7, we do not have to reallocate here.
+    memset(*output, 0, padding);
+    output_written += padding;
 
-    if ((data = elf_getdata(section, NULL)) == NULL) {
-        printf("elf_getdata failed\n");
-        goto cleanup;
-    }
-
-    for (size_t secpos=0; secpos < data->d_size; secpos += sizeof(struct nv_info_entry)) {
-        struct nv_info_entry *entry = (struct nv_info_entry *)(data->d_buf+secpos);
-        // LOGE(LOG_DBG(1), "%d: format: %#x, attr: %#x, values_size: %#x kernel: %#x, sval: %#x(%d)", 
-        // i++, entry->format, entry->attribute, entry->values_size, entry->kernel_id, 
-        // entry->value, entry->value);
-
-        if (entry->values_size != 8) {
-            printf("unexpected values_size: %#x\n",
-                 entry->values_size);
-            continue;
-        }
-
-        if (entry->attribute != EIATTR_FRAME_SIZE) {
-            continue;
-        }
-
-        if (entry->kernel_id >= symnum) {
-            printf("kernel_id out of bounds: %#x\n", entry->kernel_id);
-            continue;
-        }
-
-        if (gelf_getsym(symbol_table_data, entry->kernel_id, &sym) == NULL) {
-            printf("gelf_getsym failed for entry %d\n", entry->kernel_id);
-            continue;
-        }
-
-        if ((kernel_str = elf_strptr(elf, symtab_shdr.sh_link, sym.st_name) ) == NULL) {
-            printf("strptr failed for entry %d\n", entry->kernel_id);
-            continue;
-        }
-
-        /* When using (some?) intrinsics, nvcc adds symbols for them in the .nv.info table.
-        * They are prefixed with $__internal_7_$ and are not kernels. We skip them he
-        */
-        const char *intrinsics_prefix = "$__internal_";
-        if (strncmp(kernel_str, intrinsics_prefix, strlen(intrinsics_prefix)) == 0) {
-            continue;
-        }
-
-        if (utils_search_info(kernel_infos, kernel_str) != NULL) {
-            continue;
-        }
-
-        // TODO: printf("found new kernel: %s (symbol table id: %#x)\n", kernel_str, entry->kernel_id);
-
-        if (list_append(kernel_infos, (void**)&ki) != 0) {
-            printf("error on appending to list\n");
-            goto cleanup;
-        }
-
-        size_t buflen = strlen(kernel_str)+1;
-        if ((ki->name = malloc(buflen)) == NULL) {
-            printf("malloc failed\n");
-            goto cleanup;
-        }
-        if (strncpy(ki->name, kernel_str, buflen) != ki->name) {
-            printf("strncpy failed\n");
-            goto cleanup;
-        }
-
-        if (get_parm_for_kernel(elf, ki, memory, memsize) != 0) {
-            printf("get_parm_for_kernel failed for kernel %s\n", kernel_str);
-            goto cleanup;
-        }
-    }
-
-    ret = 0;
- cleanup:
-    if (elf != NULL) {
-        elf_end(elf);
-    }
-    return ret;
+    *output_size = output_written;
+    return input_read;
+ error:
+    free(*output);
+    *output = NULL;
+    return -1;
 }
 
 static int check_elf(Elf *elf)
@@ -437,89 +274,50 @@ static int check_elf(Elf *elf)
     int ret = -1;
 
     if ((ek = elf_kind(elf)) != ELF_K_ELF) {
-        printf("elf_kind is not ELF_K_ELF, but %d\n", ek);
+        LOGE(LOG_ERROR, "elf_kind is not ELF_K_ELF, but %d", ek);
         goto cleanup;
     }
 
     if (gelf_getehdr(elf, &ehdr) == NULL) {
-        printf("gelf_getehdr failed\n");
+        LOGE(LOG_ERROR, "gelf_getehdr failed");
         goto cleanup;
     }
 
     if ((elfclass = gelf_getclass(elf)) == ELFCLASSNONE) {
-        printf("gelf_getclass failed\n");
+        LOGE(LOG_ERROR, "gelf_getclass failed");
         goto cleanup;
     }
 
     if ((id = elf_getident(elf, NULL)) == NULL) {
-        printf("elf_getident failed\n");
+        LOGE(LOG_ERROR, "elf_getident failed");
         goto cleanup;
     }
 
-    printf("elfclass: %d-bit; elf ident[0..%d]: %7s\n",
+    LOGE(LOG_DBG(1), "elfclass: %d-bit; elf ident[0..%d]: %7s",
         (elfclass == ELFCLASS32) ? 32 : 64,
         EI_ABIVERSION, id);
 
     if (elf_getshdrnum(elf, &sections_num) != 0) {
-        printf("elf_getphdrnum failed\n");
+        LOGE(LOG_ERROR, "elf_getphdrnum failed");
         goto cleanup;
     }
 
     if (elf_getphdrnum(elf, &program_header_num) != 0) {
-        printf("elf_getshdrnum failed\n");
+        LOGE(LOG_ERROR, "elf_getshdrnum failed");
         goto cleanup;
     }
 
     if (elf_getshdrstrndx(elf, &section_str_num) != 0) {
-        printf("elf_getshstrndx Wfailed\n");
+        LOGE(LOG_ERROR, "elf_getshstrndx Wfailed");
         goto cleanup;
     }
 
-    printf("elf contains %ld sections, %ld program_headers, string table section: %ld\n",
+    LOGE(LOG_DBG(1), "elf contains %d sections, %d program_headers, string table section: %d",
         sections_num, program_header_num, section_str_num);
 
     ret = 0;
 cleanup:
     return ret;
-}
-
-static int get_symtab(Elf *elf, Elf_Data **symbol_table_data, size_t *symbol_table_size, GElf_Shdr *symbol_table_shdr)
-{
-    GElf_Shdr shdr;
-    Elf_Scn *section = NULL;
-
-    if (elf == NULL || symbol_table_data == NULL || symbol_table_size == NULL) {
-        printf("invalid argument\n");
-        return -1;
-    }
-
-    if (get_section_by_name(elf, ".symtab", &section) != 0) {
-        printf("could not find .symtab section\n");
-        return -1;
-    }
-
-    if (gelf_getshdr(section, &shdr) == NULL) {
-        printf("gelf_getshdr failed\n");
-        return -1;
-    }
-
-    if (symbol_table_shdr != NULL) {
-        *symbol_table_shdr = shdr;
-    }
-
-    if(shdr.sh_type != SHT_SYMTAB) {
-        printf("not a symbol table: %d\n", shdr.sh_type);
-        return -1;
-    }
-
-    if ((*symbol_table_data = elf_getdata(section, NULL)) == NULL) {
-        printf("elf_getdata failed\n");
-        return -1;
-    }
-
-    *symbol_table_size = shdr.sh_size / shdr.sh_entsize;
-
-    return 0;
 }
 
 static int get_section_by_name(Elf *elf, const char *name, Elf_Scn **section)
@@ -530,22 +328,22 @@ static int get_section_by_name(Elf *elf, const char *name, Elf_Scn **section)
     size_t str_section_index;
 
     if (elf == NULL || name == NULL || section == NULL) {
-        printf("invalid argument\n");
+        LOGE(LOG_ERROR, "invalid argument");
         return -1;
     }
 
     if (elf_getshdrstrndx(elf, &str_section_index) != 0) {
-        printf("elf_getshstrndx failed\n");
+        LOGE(LOG_ERROR, "elf_getshstrndx failed");
         return -1;
     }
 
     while ((scn = elf_nextscn(elf, scn)) != NULL) {
         if (gelf_getshdr(scn, &shdr) != &shdr) {
-            printf("gelf_getshdr failed\n");
+            LOGE(LOG_ERROR, "gelf_getshdr failed");
             return -1;
         }
         if ((section_name = elf_strptr(elf, str_section_index, shdr.sh_name)) == NULL) {
-            printf("elf_strptr failed\n");
+            LOGE(LOG_ERROR, "elf_strptr failed");
             return -1;
         }
         if (strcmp(section_name, name) == 0) {
@@ -556,6 +354,72 @@ static int get_section_by_name(Elf *elf, const char *name, Elf_Scn **section)
     return -1;
 }
 
+static int get_symtab(Elf *elf, Elf_Data **symbol_table_data, size_t *symbol_table_size, GElf_Shdr *symbol_table_shdr)
+{
+    GElf_Shdr shdr;
+    Elf_Scn *section = NULL;
+
+    if (elf == NULL || symbol_table_data == NULL || symbol_table_size == NULL) {
+        LOGE(LOG_ERROR, "invalid argument");
+        return -1;
+    }
+
+    if (get_section_by_name(elf, ".symtab", &section) != 0) {
+        LOGE(LOG_ERROR, "could not find .symtab section");
+        return -1;
+    }
+
+    if (gelf_getshdr(section, &shdr) == NULL) {
+        LOGE(LOG_ERROR, "gelf_getshdr failed");
+        return -1;
+    }
+
+    if (symbol_table_shdr != NULL) {
+        *symbol_table_shdr = shdr;
+    }
+
+    if(shdr.sh_type != SHT_SYMTAB) {
+        LOGE(LOG_ERROR, "not a symbol table: %d", shdr.sh_type);
+        return -1;
+    }
+
+    if ((*symbol_table_data = elf_getdata(section, NULL)) == NULL) {
+        LOGE(LOG_ERROR, "elf_getdata failed");
+        return -1;
+    }
+
+    *symbol_table_size = shdr.sh_size / shdr.sh_entsize;
+
+    return 0;
+}
+
+static char* get_kernel_section_from_kernel_name(const char *kernel_name)
+{
+    char *section_name = NULL;
+    if (kernel_name == NULL) {
+        LOGE(LOG_ERROR, "invalid argument");
+        return NULL;
+    }
+
+    if (kernel_name[0] == '$') {
+        const char *p;
+        if ((p = strchr(kernel_name+1, '$')) == NULL) {
+            LOGE(LOG_ERROR, "invalid kernel name");
+            return NULL;
+        }
+        int len = (p - kernel_name) - 1;
+        if (asprintf(&section_name, ".nv.info.%.*s", len, kernel_name+1) == -1) {
+            LOGE(LOG_ERROR, "asprintf failed");
+            return NULL;
+        }
+    } else {
+        if (asprintf(&section_name, ".nv.info.%s", kernel_name) == -1) {
+            LOGE(LOG_ERROR, "asprintf failed");
+            return NULL;
+        }
+    }
+    return section_name;
+}
 
 static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, size_t memsize)
 {
@@ -581,7 +445,7 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
     Elf_Data *data = NULL;
 
     if (kernel == NULL || kernel->name == NULL || memory == NULL) {
-        printf("at least one parameter is NULL\n");
+        LOGE(LOG_ERROR, "at least one parameter is NULL");
         goto cleanup;
     }
     kernel->param_num = 0;
@@ -590,17 +454,17 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
     kernel->param_sizes = NULL;
 
     if ((section_name = get_kernel_section_from_kernel_name(kernel->name)) == NULL) {
-        printf("get_kernel_section_from_kernel_name failed\n");
+        LOGE(LOG_ERROR, "get_kernel_section_from_kernel_name failed");
         goto cleanup;
     }
 
     if (get_section_by_name(elf, section_name, &section) != 0) {
-        printf("section %s not found\n", section_name);
+        LOGE(LOG_ERROR, "section %s not found", section_name);
         goto cleanup;
     }
 
     if ((data = elf_getdata(section, NULL)) == NULL) {
-        printf("error getting section data\n");
+        LOGE(LOG_ERROR, "error getting section data");
         goto cleanup;
     }
 
@@ -613,13 +477,13 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
         // printf("entry %d: format: %#x, attr: %#x, ", i++, entry->format, entry->attribute);
         if (entry->format == EIFMT_SVAL && entry->attribute == EIATTR_KPARAM_INFO) {
             if (entry->values_size != 0xc) {
-                printf("EIATTR_KPARAM_INFO values size has not the expected value of 0xc\n");
+                LOGE(LOG_ERROR, "EIATTR_KPARAM_INFO values size has not the expected value of 0xc");
                 goto cleanup;
             }
             struct nv_info_kparam_info *kparam = (struct nv_info_kparam_info*)&entry->values;
             // printf("kparam: index: %#x, ordinal: %#x, offset: %#x, unknown: %#0x, cbank: %#0x, size: %#0x\n",
             //     kparam->index, kparam->ordinal, kparam->offset, kparam->unknown, kparam->cbank, kparam->size);
-            // TODO: printf("param %d: offset: %#x, size: %#x\n", kparam->ordinal, kparam->offset, kparam->size);
+            LOGE(LOG_DBG(1), "param %d: offset: %#x, size: %#x", kparam->ordinal, kparam->offset, kparam->size);
             if (kparam->ordinal >= kernel->param_num) {
                 kernel->param_offsets = realloc(kernel->param_offsets,
                                               (kparam->ordinal+1)*sizeof(uint16_t));
@@ -632,7 +496,7 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
             secpos += sizeof(struct nv_info_kernel_entry) + entry->values_size-4;
         } else if (entry->format == EIFMT_HVAL && entry->attribute == EIATTR_CBANK_PARAM_SIZE) {
             kernel->param_size = entry->values_size;
-            printf("cbank_param_size: %#0x\n", entry->values_size);
+            LOGE(LOG_DEBUG, "cbank_param_size: %#0x", entry->values_size);
             secpos += sizeof(struct nv_info_kernel_entry)-4;
         } else if (entry->format == EIFMT_HVAL) {
             // printf("hval: %#x(%d)\n", entry->values_size, entry->values_size);
@@ -648,7 +512,7 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
             // printf("nval\n");
             secpos += sizeof(struct nv_info_kernel_entry)-4;
         } else {
-            printf("unknown format: %#x\n", entry->format);
+            LOGE(LOG_WARNING, "unknown format: %#x", entry->format);
             secpos += sizeof(struct nv_info_kernel_entry)-4;
         }
     }
@@ -659,30 +523,221 @@ static int get_parm_for_kernel(Elf *elf, kernel_info_t *kernel, void* memory, si
     return ret;
 }
 
-static char* get_kernel_section_from_kernel_name(const char *kernel_name)
+static int elf2_parameter_info(list *kernel_infos, void* memory, size_t memsize)
 {
-    char *section_name = NULL;
-    if (kernel_name == NULL) {
-        printf("invalid argument\n");
-        return NULL;
+    struct __attribute__((__packed__)) nv_info_entry{
+        uint8_t format;
+        uint8_t attribute;
+        uint16_t values_size;
+        uint32_t kernel_id;
+        uint32_t value;
+    };
+
+    Elf *elf = NULL;
+    Elf_Scn *section = NULL;
+    Elf_Data *data = NULL, *symbol_table_data = NULL;
+    GElf_Shdr symtab_shdr;
+    size_t symnum;
+    int i = 0;
+    GElf_Sym sym;
+
+    int ret = -1;
+    kernel_info_t *ki = NULL;
+    const char *kernel_str;
+
+    if (memory == NULL || memsize == 0) {
+        LOGE(LOG_ERROR, "memory was NULL or memsize was 0");
+        return -1;
     }
 
-    if (kernel_name[0] == '$') {
-        const char *p;
-        if ((p = strchr(kernel_name+1, '$')) == NULL) {
-            printf("invalid kernel name\n");
-            return NULL;
+// #define ELF_DUMP_TO_FILE 1
+
+#ifdef ELF_DUMP_TO_FILE
+    FILE* fd2 = fopen("/tmp/cricket-elf-dump", "wb");
+    fwrite(memory, memsize, 1, fd2);
+    fclose(fd2);
+#endif
+
+    if ((elf = elf_memory(memory, memsize)) == NULL) {
+        LOGE(LOG_ERROR, "elf_memory failed");
+        goto cleanup;
+    }
+
+    if (check_elf(elf) != 0) {
+        LOGE(LOG_ERROR, "check_elf failed");
+        goto cleanup;
+    }
+
+    if (get_symtab(elf, &symbol_table_data, &symnum, &symtab_shdr) != 0) {
+        LOGE(LOG_ERROR, "could not get symbol table");
+        goto cleanup;
+    }
+
+    if (get_section_by_name(elf, ".nv.info", &section) != 0) {
+        LOGE(LOG_WARNING, "could not find .nv.info section. This means this binary does not contain any kernels.");
+        ret = 0;    // This is not an error.
+        goto cleanup;
+    }
+
+    if ((data = elf_getdata(section, NULL)) == NULL) {
+        LOGE(LOG_ERROR, "elf_getdata failed");
+        goto cleanup;
+    }
+
+    for (size_t secpos=0; secpos < data->d_size; secpos += sizeof(struct nv_info_entry)) {
+        struct nv_info_entry *entry = (struct nv_info_entry *)(data->d_buf+secpos);
+        // LOGE(LOG_DBG(1), "%d: format: %#x, attr: %#x, values_size: %#x kernel: %#x, sval: %#x(%d)", 
+        // i++, entry->format, entry->attribute, entry->values_size, entry->kernel_id, 
+        // entry->value, entry->value);
+
+        if (entry->values_size != 8) {
+            LOGE(LOG_WARNING, "unexpected values_size: %#x",
+                 entry->values_size);
+            continue;
         }
-        int len = (p - kernel_name) - 1;
-        if (asprintf(&section_name, ".nv.info.%.*s", len, kernel_name+1) == -1) {
-            printf("asprintf failed\n");
-            return NULL;
+
+        if (entry->attribute != EIATTR_FRAME_SIZE) {
+            continue;
         }
-    } else {
-        if (asprintf(&section_name, ".nv.info.%s", kernel_name) == -1) {
-            printf("asprintf failed\n");
-            return NULL;
+
+        if (entry->kernel_id >= symnum) {
+            LOGE(LOG_ERROR, "kernel_id out of bounds: %#x", entry->kernel_id);
+            continue;
+        }
+
+        if (gelf_getsym(symbol_table_data, entry->kernel_id, &sym) == NULL) {
+            LOGE(LOG_ERROR, "gelf_getsym failed for entry %d", entry->kernel_id);
+            continue;
+        }
+
+        if ((kernel_str = elf_strptr(elf, symtab_shdr.sh_link, sym.st_name) ) == NULL) {
+            LOGE(LOG_ERROR, "strptr failed for entry %d", entry->kernel_id);
+            continue;
+        }
+
+        /* When using (some?) intrinsics, nvcc adds symbols for them in the .nv.info table.
+        * They are prefixed with $__internal_7_$ and are not kernels. We skip them he
+        */
+        const char *intrinsics_prefix = "$__internal_";
+        if (strncmp(kernel_str, intrinsics_prefix, strlen(intrinsics_prefix)) == 0) {
+            continue;
+        }
+
+        if (utils_search_info(kernel_infos, kernel_str) != NULL) {
+            continue;
+        }
+
+        LOGE(LOG_DEBUG, "found new kernel: %s (symbol table id: %#x)", kernel_str, entry->kernel_id);
+
+        if (list_append(kernel_infos, (void**)&ki) != 0) {
+            LOGE(LOG_ERROR, "error on appending to list");
+            goto cleanup;
+        }
+
+        size_t buflen = strlen(kernel_str)+1;
+        if ((ki->name = malloc(buflen)) == NULL) {
+            LOGE(LOG_ERROR, "malloc failed");
+            goto cleanup;
+        }
+        if (strncpy(ki->name, kernel_str, buflen) != ki->name) {
+            LOGE(LOG_ERROR, "strncpy failed");
+            goto cleanup;
+        }
+
+        if (get_parm_for_kernel(elf, ki, memory, memsize) != 0) {
+            LOGE(LOG_ERROR, "get_parm_for_kernel failed for kernel %s", kernel_str);
+            goto cleanup;
         }
     }
-    return section_name;
+
+    ret = 0;
+ cleanup:
+    if (elf != NULL) {
+        elf_end(elf);
+    }
+    return ret;
+}
+
+int elf2_get_fatbin_info(const struct fat_header *fatbin, list *kernel_infos, uint8_t** fatbin_mem, size_t* fatbin_size)
+{
+    struct fat_elf_header* eh;
+    struct fat_text_header* th;
+    const uint8_t *input_pos = NULL;
+    const uint8_t *fatbin_data = NULL;
+    uint8_t *text_data = NULL;
+    size_t text_data_size = 0;
+    size_t fatbin_total_size = 0;
+    int ret = -1;
+    if (fatbin == NULL || fatbin_mem == NULL || fatbin_size == NULL) {
+        LOGE(LOG_ERROR, "at least one parameter is NULL");
+        goto error;
+    }
+    fatbin_data = input_pos = (const uint8_t*)fatbin->text;
+    if (fatbin->magic != FATBIN_STRUCT_MAGIC) {
+        LOGE(LOG_ERROR, "fatbin struct magic number is wrong. Got %llx, expected %llx.", fatbin->magic, FATBIN_STRUCT_MAGIC);
+        goto error;
+    }
+    LOGE(LOG_DBG(1), "Fatbin: magic: %x, version: %x, text: %lx, data: %lx, ptr: %lx, ptr2: %lx, zero: %lx",
+           fatbin->magic, fatbin->version, fatbin->text, fatbin->data, fatbin->unknown, fatbin->text2, fatbin->zero);
+
+    if (get_elf_header((uint8_t*)fatbin->text, sizeof(struct fat_elf_header), &eh) != 0) {
+        LOGE(LOG_ERROR, "Something went wrong while checking the header.");
+        goto error;
+    }
+    // LOGE(LOG_DBG(1), "elf header: magic: %#x, version: %#x, header_size: %#x, size: %#zx",
+    //        eh->magic, eh->version, eh->header_size, eh->size); 
+
+    input_pos += eh->header_size;
+    fatbin_total_size = eh->header_size + eh->size;
+    do {
+        if (get_text_header(input_pos, *fatbin_size - (input_pos - fatbin_data) - eh->header_size, &th) != 0) {
+            LOGE(LOG_ERROR, "Something went wrong while checking the header.");
+            goto error;
+        }
+        //print_header(th);
+        input_pos += th->header_size;
+        if (th->kind != 2) { // section does not cotain device code (but e.g. PTX)
+            input_pos += th->size;
+            continue;
+        }
+        if (th->flags & FATBIN_FLAG_DEBUG) {
+            LOGE(LOG_DEBUG, "fatbin contains debug information.");
+        }
+
+        if (th->flags & FATBIN_FLAG_COMPRESS) {
+            ssize_t input_read;
+
+            LOGE(LOG_DEBUG, "fatbin contains compressed device code. Decompressing...");
+            if ((input_read = decompress_single_section(input_pos, &text_data, &text_data_size, eh, th)) < 0) {
+                LOGE(LOG_ERROR, "Something went wrong while decompressing text section.");
+                goto error;
+            }
+            input_pos += input_read;
+            //hexdump(text_data, text_data_size);
+        } else {
+            text_data = (uint8_t*)input_pos;
+            text_data_size = th->size;
+            input_pos += th->size;
+        }
+        // print_header(th);
+        if (elf2_parameter_info(kernel_infos, text_data , text_data_size) != 0) {
+            LOGE(LOG_ERROR, "error getting parameter info");
+            goto error;
+        }
+        if (th->flags & FATBIN_FLAG_COMPRESS) {
+            free(text_data);
+        }
+    } while (input_pos < (uint8_t*)eh + eh->header_size + eh->size);
+
+    // if (get_elf_header((uint8_t*)fatbin->text2, sizeof(struct fat_elf_header), &eh) != 0) {
+    //     LOGE(LOG_ERROR, "Something went wrong while checking the header.");
+    //     goto error;
+    // }
+    // fatbin_total_size += eh->header_size + eh->size;
+
+    *fatbin_mem = (void*)fatbin->text;
+    *fatbin_size = fatbin_total_size;
+    ret = 0;
+ error:
+    return ret;
 }
