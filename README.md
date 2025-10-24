@@ -8,7 +8,7 @@ nvcc -shared -Xcompiler -fPIC -o fake_libinit.so \
     cuda_init.c list.o my_elf.o util.o resource-mg.o log.o \
     -I. -lelf -lcudart
 
-LD_PRELOAD=./libmyelf.so python3 test.py
+LD_PRELOAD=./fake_libinit.so python3 test/test.py
 
 gcc -o resource-mg.o resource-mg.c log.c list.c -I.
 

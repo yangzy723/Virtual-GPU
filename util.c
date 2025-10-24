@@ -1,20 +1,21 @@
 #include "util.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <dlfcn.h>
 #include <string.h>
 
-kernel_info_t* utils_search_info(list *_kernel_infos, const char *kernelname)
+kernel_info_t* utils_search_info(list *kernel_infos, const char *kernelname)
 {
     kernel_info_t *info = NULL;
-    if (_kernel_infos == NULL) {
-        printf("list is NULL.\n");
+    if (kernel_infos == NULL) {
+        LOGE(LOG_ERROR, "list is NULL.");
         return NULL;
     }
-    printf("searching for %s in %ld entries\n", kernelname, _kernel_infos->length);
-    for (int i=0; i < _kernel_infos->length; ++i) {
-        if (list_at(_kernel_infos, i, (void**)&info) != 0) {
-            printf("no element at index %d\n", i);
+    LOGE(LOG_DBG(1), "searching for %s in %d entries", kernelname, kernel_infos->length);
+    for (int i=0; i < kernel_infos->length; ++i) {
+        if (list_at(kernel_infos, i, (void**)&info) != 0) {
+            LOGE(LOG_ERROR, "no element at index %d", i);
         }
         if (strcmp(kernelname, info->name) == 0) {
             return info;

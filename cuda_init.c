@@ -17,6 +17,10 @@ typedef CUresult (*orig___cuModuleGetFunction_t)(CUfunction *hfunc, CUmodule hmo
 
 list kernel_infos;
 
+__attribute__((constructor)) static void init(void) {
+    list_init(&kernel_infos, sizeof(kernel_info_t));
+}
+
 int cnt = 0;
 static orig___cuModuleLoadData_t orig_cuModuleLoadData = NULL;
 void **__cudaRegisterFatBinary(void *fatCubin)
@@ -47,12 +51,14 @@ void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
                             int thread_limit, uint3 *tid, uint3 *bid,
                             dim3 *bDim, dim3 *gDim, int *wSize)
 {
+    // 打印出来 deviceFun 和 deviceName 好像是一样的
+    // printf("%s\n", deviceName);
     kernel_info_t *info = utils_search_info(&kernel_infos, (char *)deviceName);
     if (info == NULL) {
-        // printf("request to register unknown function: \"%s\"", deviceName);
+        // printf("request to register unknown function: \"%s\"\n", deviceName);
         return;
     } else {
-        printf("request to register known function: \"%s\"", deviceName);
+        // printf("request to register known function: \"%s\"\n", deviceName);
         CUfunction f;
         CUmodule module = resource_mg_get(&rm_modules, (void *)fatCubinHandle);
         if (orig_cuModuleGetFunction == NULL)

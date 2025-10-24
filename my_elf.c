@@ -643,7 +643,6 @@ static int elf2_parameter_info(list *kernel_infos, void* memory, size_t memsize)
             LOGE(LOG_ERROR, "strncpy failed");
             goto cleanup;
         }
-
         if (get_parm_for_kernel(elf, ki, memory, memsize) != 0) {
             LOGE(LOG_ERROR, "get_parm_for_kernel failed for kernel %s", kernel_str);
             goto cleanup;

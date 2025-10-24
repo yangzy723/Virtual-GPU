@@ -3,19 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 
 #define INITIAL_CAPACITY 4
 
 int list_init(list *l, size_t element_size)
 {
-    if (l == NULL) {
-        printf("list parameter is NULL\n");
-        return 1;
-    }
-    if (element_size == 0LL) {
-        printf("element_size of 0 does not make sense\n");
-        return 1;
-    }
+    assert(l != NULL);
+    assert(element_size != 0);
     memset(l, 0, sizeof(list));
     if ((l->elements = malloc(INITIAL_CAPACITY*element_size)) == NULL) {
         printf("allocation failed\n");
