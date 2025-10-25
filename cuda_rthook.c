@@ -4,9 +4,11 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <string.h>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include "util.h"
 #include "resource-mg.h"
 
 static unsigned long long g_kernel_count = 0;
@@ -74,13 +76,6 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
         gridDim.x, gridDim.y, gridDim.z,
         blockDim.x, blockDim.y, blockDim.z,
         sharedMem, (CUstream)stream, args, NULL);
-}
-
-/* ---- 构造/析构 ---- */
-__attribute__((constructor)) static void hook_init(void) {
-    g_kernel_count = 0;
-}
-
-__attribute__((destructor)) static void hook_fini(void) {
-    fprintf(stderr, "[HOOK] Total kernels launched: %llu\n", g_kernel_count);
+    
+    // return real_cuda(func, gridDim, blockDim, args, sharedMem, stream);
 }

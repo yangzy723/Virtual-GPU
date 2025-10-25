@@ -14,11 +14,15 @@
 
 typedef CUresult (*orig___cuModuleLoadData_t)(CUmodule *module, const void *image);
 typedef CUresult (*orig___cuModuleGetFunction_t)(CUfunction *hfunc, CUmodule hmod, const char *name);
+typedef CUresult (*orig___cuModuleGetGlobal_t)(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 
 list kernel_infos;
 
 __attribute__((constructor)) static void init(void) {
     list_init(&kernel_infos, sizeof(kernel_info_t));
+    resource_mg_init(&rm_modules, 0);
+    resource_mg_init(&rm_functions, 0);
+    resource_mg_init(&rm_globals, 0);
 }
 
 int cnt = 0;
@@ -26,7 +30,6 @@ static orig___cuModuleLoadData_t orig_cuModuleLoadData = NULL;
 void **__cudaRegisterFatBinary(void *fatCubin)
 {
     cnt++;
-    printf("__cudaRegisterFatBinary(fatCubin=%p), called %d times\n", fatCubin, cnt);
 
     uint8_t *fatbin_data = NULL;
     size_t fatbin_size = 0;
@@ -43,6 +46,20 @@ void **__cudaRegisterFatBinary(void *fatCubin)
     orig_cuModuleLoadData(&module, fatbin_data);
     resource_mg_add_sorted(&rm_modules, (void *)result, (void *)module);
     return result;
+}
+
+static orig___cuModuleGetGlobal_t orig_cuModuleGetGlobal = NULL;
+void __cudaRegisterVar(void **fatCubinHandle, char *hostVar, char *deviceAddress,
+                       const char *deviceName, int ext, size_t size, int constant,
+                       int global)
+{
+    size_t d_size = 0;
+    CUdeviceptr dptr = 0;
+    CUmodule module = resource_mg_get(&rm_modules, (void *)fatCubinHandle);
+    if (orig_cuModuleGetGlobal == NULL)
+        orig_cuModuleGetGlobal = get_sym("cuModuleGetGlobal");
+    orig_cuModuleGetGlobal(&dptr, &d_size, module, deviceName);
+    resource_mg_add_sorted(&rm_globals, (void *)hostVar, (void *)dptr);
 }
 
 static orig___cuModuleGetFunction_t orig_cuModuleGetFunction = NULL;

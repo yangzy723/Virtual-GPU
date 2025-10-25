@@ -5,6 +5,7 @@
 
 resource_mg rm_modules;
 resource_mg rm_functions;
+resource_mg rm_globals;
 
 int resource_mg_init(resource_mg *mg, int bypass)
 {

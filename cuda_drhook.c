@@ -1,11 +1,12 @@
-#include "util.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <stdint.h>
 #include <pthread.h>
+
 #include <cuda.h>
+
+#include "util.h"
 
 static unsigned long long g_kernel_count = 0;
 static pthread_mutex_t g_kernel_count_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -72,14 +73,4 @@ CUresult cuLaunchKernel(
     return real(f, gridDimX, gridDimY, gridDimZ,
                 blockDimX, blockDimY, blockDimZ,
                 sharedMemBytes, hStream, kernelParams, extra);
-}
-
-/* ---- 构造/析构 ---- */
-__attribute__((constructor)) static void hook_init(void) {
-    g_kernel_count = 0;
-    fprintf(stderr, "[HOOK] Driver API hook init\n");
-}
-
-__attribute__((destructor)) static void hook_fini(void) {
-    fprintf(stderr, "[HOOK] Driver API: total kernels launched = %llu\n", g_kernel_count);
 }
