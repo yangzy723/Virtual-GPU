@@ -7,7 +7,7 @@ CFLAGS = -fPIC -I.
 NVCCFLAGS = -shared -Xcompiler -fPIC
 
 # 目标文件
-OBJS = log.o list.o my_elf.o resource-mg.o util.o
+OBJS = log.o list.o my_elf.o resource-mg.o util.o gsched_none.o
 
 # 输出库文件
 TARGET1 = fake_libinit.so

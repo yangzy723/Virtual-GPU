@@ -10,6 +10,7 @@
 
 #include "util.h"
 #include "resource-mg.h"
+#include "gsched.h"
 
 static unsigned long long g_kernel_count = 0;
 static pthread_mutex_t g_kernel_count_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -43,6 +44,7 @@ HOOK_DECLARE(cudaError_t, cudaMemcpyAsync,
 
 // 自定义 Hook: cudaLaunchKernel
 typedef cudaError_t (*cudaLaunchKernel_t)(const void *, dim3, dim3, void **, size_t, cudaStream_t);
+typedef cudaError_t (*cudaSetDevice_t)(int);
 typedef CUresult (*cuLaunchKernel_t)(
     CUfunction f,
     unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -51,10 +53,6 @@ typedef CUresult (*cuLaunchKernel_t)(
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
                              void **args, size_t sharedMem, cudaStream_t stream) {
-    static cudaLaunchKernel_t real_cuda = NULL;
-    if (!real_cuda) real_cuda = (cudaLaunchKernel_t)get_sym("cudaLaunchKernel");
-    if (!real_cuda) return cudaErrorUnknown;
-
     static cuLaunchKernel_t real_cu = NULL;
     if (!real_cu) real_cu = (cuLaunchKernel_t)get_sym("cuLaunchKernel");
     if (!real_cu) return cudaErrorUnknown;
@@ -71,11 +69,15 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim,
             blockDim.x, blockDim.y, blockDim.z,
             sharedMem, (void*)stream);
 
-    return real_cu(
+    cudaError_t result = real_cu(
         (CUfunction)resource_mg_get(&rm_functions, (void *)func),
         gridDim.x, gridDim.y, gridDim.z,
         blockDim.x, blockDim.y, blockDim.z,
         sharedMem, (CUstream)stream, args, NULL);
-    
-    // return real_cuda(func, gridDim, blockDim, args, sharedMem, stream);
+
+    if(result != CUDA_SUCCESS) {
+        fprintf(stderr, "[HOOK] cuLaunchKernel failed: %d\n", result);
+    }
+    return result;
 }
+
