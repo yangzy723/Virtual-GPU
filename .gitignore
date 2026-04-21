@@ -1,3 +1,9 @@
-!*.c
-!*.h
-*.*
+build/
+.vscode/
+*.so
+*.o
+*.a
+*.out
+*.log
+*.sock
+.DS_Store
