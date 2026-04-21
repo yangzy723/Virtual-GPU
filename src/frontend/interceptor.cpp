@@ -4,12 +4,12 @@
 #include <cstdint>
 #include <cstring>
 
-#include "vgpu/context_registry.h"
-#include "vgpu/cuda_abi.h"
-#include "vgpu/protocol.h"
-#include "vgpu/rpc_client.h"
-#include "vgpu/fatbin_parser.h"
-#include "vgpu/kernel_registry.h"
+#include "vgpu/common/context_registry.h"
+#include "vgpu/common/cuda_abi.h"
+#include "vgpu/common/protocol.h"
+#include "vgpu/common/rpc_client.h"
+#include "vgpu/common/fatbin_parser.h"
+#include "vgpu/common/kernel_registry.h"
 
 namespace vgpu {
 namespace {

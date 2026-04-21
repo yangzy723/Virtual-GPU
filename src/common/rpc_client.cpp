@@ -1,4 +1,4 @@
-#include "vgpu/rpc_client.h"
+#include "vgpu/common/rpc_client.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>

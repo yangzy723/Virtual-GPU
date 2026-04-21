@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "vgpu/cuda_abi.h"
+#include "vgpu/common/cuda_abi.h"
 
 extern "C" cudaError_t cudaGetDeviceCount(int* count);
 extern "C" cudaError_t cudaRuntimeGetVersion(int* runtimeVersion);

@@ -1,4 +1,4 @@
-#include "vgpu/context_registry.h"
+#include "vgpu/common/context_registry.h"
 
 #include <sys/types.h>
 #include <unistd.h>

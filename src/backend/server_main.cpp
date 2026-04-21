@@ -12,11 +12,11 @@
 #include <thread>
 #include <vector>
 
-#include "vgpu/cuda_abi.h"
-#include "vgpu/cuda_runtime_loader.h"
-#include "vgpu/protocol.h"
-#include "vgpu/cuda_driver_loader.h"
-#include "vgpu/fatbin_parser.h"
+#include "vgpu/common/cuda_abi.h"
+#include "vgpu/backend/cuda_runtime_loader.h"
+#include "vgpu/common/protocol.h"
+#include "vgpu/backend/cuda_driver_loader.h"
+#include "vgpu/common/fatbin_parser.h"
 
 #include <atomic>
 #include <mutex>

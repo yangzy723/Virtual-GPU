@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "vgpu/cuda_abi.h"
-#include "vgpu/protocol.h"
+#include "vgpu/common/cuda_abi.h"
+#include "vgpu/common/protocol.h"
 
 namespace vgpu {
 

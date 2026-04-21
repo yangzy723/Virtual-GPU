@@ -41,13 +41,13 @@
 #include <cstring>
 #include <vector>
 
-#include "vgpu/context_registry.h"
-#include "vgpu/cuda_abi.h"
-#include "vgpu/cuda_driver_loader.h"
-#include "vgpu/fatbin_parser.h"
-#include "vgpu/kernel_registry.h"
-#include "vgpu/protocol.h"
-#include "vgpu/rpc_client.h"
+#include "vgpu/common/context_registry.h"
+#include "vgpu/common/cuda_abi.h"
+#include "vgpu/backend/cuda_driver_loader.h"
+#include "vgpu/common/fatbin_parser.h"
+#include "vgpu/common/kernel_registry.h"
+#include "vgpu/common/protocol.h"
+#include "vgpu/common/rpc_client.h"
 
 namespace vgpu {
 namespace {

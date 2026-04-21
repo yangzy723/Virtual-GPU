@@ -2,7 +2,7 @@
 
 #include <mutex>
 
-#include "vgpu/cuda_abi.h"
+#include "vgpu/common/cuda_abi.h"
 
 namespace vgpu {
 

@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vgpu/fatbin_parser.h"
+#include "vgpu/common/fatbin_parser.h"
 
 namespace vgpu {
 

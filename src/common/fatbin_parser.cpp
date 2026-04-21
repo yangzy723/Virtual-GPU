@@ -1,4 +1,4 @@
-#include "vgpu/fatbin_parser.h"
+#include "vgpu/common/fatbin_parser.h"
 
 #include <algorithm>
 #include <cctype>

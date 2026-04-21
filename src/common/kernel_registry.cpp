@@ -1,4 +1,4 @@
-#include "vgpu/kernel_registry.h"
+#include "vgpu/common/kernel_registry.h"
 
 namespace vgpu {
 
