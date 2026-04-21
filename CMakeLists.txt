@@ -19,6 +19,7 @@ set(VGPU_COMMON_SOURCES
     src/common/fatbin_parser.cpp
     src/common/kernel_registry.cpp
     src/common/rpc_client.cpp
+    src/common/dlopen_hook.cpp
 )
 
 function(vgpu_configure_shared_target target)
@@ -63,6 +64,17 @@ add_library(vgpu_cuda_driver_shim SHARED
 )
 set_target_properties(vgpu_cuda_driver_shim PROPERTIES OUTPUT_NAME cuda)
 vgpu_configure_shared_target(vgpu_cuda_driver_shim)
+
+# Convenience library for PyTorch integration
+# Combines dlopen hooking and preload initialization
+add_library(vgpu_preload_init SHARED
+    src/common/cuda_preload_init.cpp
+    src/common/dlopen_hook.cpp
+)
+set_target_properties(vgpu_preload_init PROPERTIES OUTPUT_NAME vgpu_preload_init)
+target_include_directories(vgpu_preload_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vgpu_preload_init PRIVATE dl pthread)
+target_compile_definitions(vgpu_preload_init PRIVATE _GNU_SOURCE)
 
 add_executable(vgpu_server
     src/backend/server_main.cpp

@@ -83,7 +83,29 @@ Virtual-GPU 是一个前后端分离的 CUDA 拦截系统：客户端只需加�
 - `cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`
 - `cuMemAlloc_v2`, `cuMemFree_v2`, `cuMemcpyHtoD_v2`, `cuMemcpyDtoH_v2`, `cuMemcpyDtoD_v2`
 
-## 五、如何使用
+## 五、PyTorch 集成
+
+Virtual-GPU 提供了 **dlopen 钩子机制** 来支持 PyTorch 的透明拦截。
+
+PyTorch 会在运行时通过 `dlopen()` 动态加载 CUDA 库，而不是使用 LD_PRELOAD。Virtual-GPU 现在通过拦截 dlopen 调用来确保 PyTorch 加载我们的伪库。
+
+**快速开始**（详见 [PYTORCH_INTEGRATION.md](PYTORCH_INTEGRATION.md)）：
+
+```bash
+# 编译
+cmake -S . -B build && cmake --build build -j
+
+# 启动服务
+VGPU_SERVER_SOCK=/tmp/vgpu_server.sock ./build/vgpu_server &
+
+# 运行 PyTorch（使用 dlopen 钩子）
+export LD_PRELOAD=/path/to/build/libvgpu_preload_init.so:/path/to/build/libcuda.so:/path/to/build/libcudart.so
+python my_pytorch_app.py
+```
+
+PyTorch 的矩阵乘、卷积等操作现在将被透明转发到后端服务执行。
+
+## 六、如何使用
 
 ### 1. 构建
 
@@ -139,7 +161,7 @@ export LD_LIBRARY_PATH=$PWD/build:${LD_LIBRARY_PATH}
 ./build/vgpu_runtime_kernel_launch_test
 ```
 
-## 六、运行策略开关（后端生效）
+## 七、运行策略开关（后端生效）
 
 ```bash
 export VGPU_VERBOSE=1
