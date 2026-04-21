@@ -15,10 +15,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(VGPU_BUILD_TESTS "Build Virtual-GPU smoke tests" ON)
 
 set(VGPU_COMMON_SOURCES
-    src/context_registry.cpp
-    src/fatbin_parser.cpp
-    src/kernel_registry.cpp
-    src/rpc_client.cpp
+    src/common/context_registry.cpp
+    src/common/fatbin_parser.cpp
+    src/common/kernel_registry.cpp
+    src/common/rpc_client.cpp
 )
 
 function(vgpu_configure_shared_target target)
@@ -45,30 +45,30 @@ function(vgpu_add_cuda_test target source)
 endfunction()
 
 add_library(vgpu_intercept SHARED
-    src/interceptor.cpp
+    src/frontend/interceptor.cpp
     ${VGPU_COMMON_SOURCES}
 )
 vgpu_configure_shared_target(vgpu_intercept)
 
 add_library(vgpu_cudart_shim SHARED
-    src/interceptor.cpp
+    src/frontend/interceptor.cpp
     ${VGPU_COMMON_SOURCES}
 )
 set_target_properties(vgpu_cudart_shim PROPERTIES OUTPUT_NAME cudart)
 vgpu_configure_shared_target(vgpu_cudart_shim)
 
 add_library(vgpu_cuda_driver_shim SHARED
-    src/driver_interceptor.cpp
+    src/frontend/driver_interceptor.cpp
     ${VGPU_COMMON_SOURCES}
 )
 set_target_properties(vgpu_cuda_driver_shim PROPERTIES OUTPUT_NAME cuda)
 vgpu_configure_shared_target(vgpu_cuda_driver_shim)
 
 add_executable(vgpu_server
-    src/server_main.cpp
-    src/cuda_driver_loader.cpp
-    src/cuda_runtime_loader.cpp
-    src/fatbin_parser.cpp
+    src/backend/server_main.cpp
+    src/backend/cuda_driver_loader.cpp
+    src/backend/cuda_runtime_loader.cpp
+    src/common/fatbin_parser.cpp
 )
 target_include_directories(vgpu_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(vgpu_server PRIVATE dl pthread)
