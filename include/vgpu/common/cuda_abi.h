@@ -27,6 +27,8 @@ struct dim3 {
 };
 
 static constexpr cudaError_t cudaSuccess = 0;
+static constexpr cudaError_t cudaErrorInvalidValue = 1;
+static constexpr cudaError_t cudaErrorNotSupported = 801;
 static constexpr cudaError_t cudaErrorUnknown = 999;
 
 static constexpr unsigned int cudaEventDefault = 0;

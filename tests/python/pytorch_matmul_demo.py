@@ -9,11 +9,10 @@ PyTorch CUDA 矩阵乘示例 - 演示 Virtual-GPU 拦截
   # 使用 dlopen 钩子运行该脚本
   export LD_PRELOAD=/path/to/libvgpu_preload_init.so:/path/to/libcuda.so:/path/to/libcudart.so
   export VGPU_DEBUG=1
-  python3 pytorch_matmul_example.py
+    python3 tests/python/pytorch_matmul_demo.py
 """
 
 import sys
-import os
 
 # 检查 PyTorch 是否可用
 try:
@@ -44,7 +43,7 @@ def main():
         print(f"[pytorch] Matrix A shape: {A.shape}, device: {A.device}")
         print(f"[pytorch] Matrix B shape: {B.shape}, device: {B.device}")
         
-        # 执行矩阵乘法（这会触发 cuBLAS -> cuLaunchKernel）
+        # 执行矩阵乘法（走 cuBLAS -> cuLaunchKernel）
         print("[pytorch] Starting matrix multiplication (torch.matmul)...")
         C = torch.matmul(A, B)
         
@@ -74,7 +73,7 @@ def main():
         print("\n[pytorch] Testing linear layer (uses GEMM internally)...")
         linear = torch.nn.Linear(size, size, bias=False, device='cuda')
         x = torch.randn(16, size, device='cuda')  # 批处理
-        
+
         y = linear(x)
         print(f"[pytorch] Linear layer output shape: {y.shape}")
         print(f"[pytorch] Linear layer output mean: {y.mean().item():.6f}")

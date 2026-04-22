@@ -25,6 +25,7 @@ static constexpr CUresult CUDA_SUCCESS                = 0;
 static constexpr CUresult CUDA_ERROR_INVALID_VALUE    = 1;
 static constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY    = 2;
 static constexpr CUresult CUDA_ERROR_NOT_INITIALIZED  = 3;
+static constexpr CUresult CUDA_ERROR_NOT_READY        = 600;
 static constexpr CUresult CUDA_ERROR_NOT_FOUND        = 500;
 static constexpr CUresult CUDA_ERROR_NOT_SUPPORTED    = 801;
 static constexpr CUresult CUDA_ERROR_UNKNOWN          = 999;
@@ -81,6 +82,11 @@ struct CudaDriverApi {
 
     // Introspection
     CUresult (*cuFuncGetAttribute)(int* pi, int attrib, CUfunction hfunc);
+    CUresult (*cuFuncGetParamInfo)(CUfunction func, std::size_t paramIndex, std::size_t* paramOffset, std::size_t* paramSize);
+
+    // Diagnostics
+    CUresult (*cuGetErrorName)(CUresult error, const char** pStr);
+    CUresult (*cuGetErrorString)(CUresult error, const char** pStr);
 };
 
 class CudaDriverLoader {

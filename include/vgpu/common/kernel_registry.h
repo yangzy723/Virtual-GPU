@@ -28,12 +28,12 @@ public:
 
     // hostFun pointer → KernelEntry
     void addKernel(const void* host_fun, KernelEntry entry);
-    const KernelEntry* findKernel(const void* host_fun) const;
+    bool findKernel(const void* host_fun, KernelEntry* out) const;
 
-    // mangled device function name → param info
-    // (populated when the fatbin is parsed at registration time)
-    void addParamInfo(const std::string& mangled_name, std::vector<ParamInfo> params);
-    const std::vector<ParamInfo>* findParamInfo(const std::string& mangled_name) const;
+    // (module_id, mangled device function name) → param info
+    // Populated when the fatbin is parsed at module load/registration time.
+    void addParamInfo(uint64_t module_id, const std::string& mangled_name, std::vector<ParamInfo> params);
+    bool findParamInfo(uint64_t module_id, const std::string& mangled_name, std::vector<ParamInfo>* out) const;
 
     // Driver-shim handle table (CUmodule / CUfunction fake handles → server IDs)
     // We reuse the same maps with different key spaces:
@@ -43,14 +43,14 @@ public:
 
     //   driver CUfunction handle → KernelEntry
     void addDriverFunc(void* cu_func_handle, KernelEntry entry);
-    const KernelEntry* findDriverFunc(void* cu_func_handle) const;
+    bool findDriverFunc(void* cu_func_handle, KernelEntry* out) const;
 
 private:
     mutable std::mutex mutex_;
 
     std::unordered_map<void*, uint64_t>        handle_to_module_;
     std::unordered_map<const void*, KernelEntry> func_to_entry_;
-    std::unordered_map<std::string, std::vector<ParamInfo>> name_to_params_;
+    std::unordered_map<uint64_t, std::unordered_map<std::string, std::vector<ParamInfo>>> module_to_params_;
 
     std::unordered_map<void*, uint64_t>        drv_mod_to_id_;
     std::unordered_map<void*, KernelEntry>     drv_func_to_entry_;

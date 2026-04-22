@@ -34,6 +34,19 @@ const uint8_t* resolveImage(const void* fat_data, size_t& out_size) {
 
     if (magic != kFatBinMagic) return nullptr;
 
+    // CUDA 12+ fatbin header variant:
+    //   uint32 magic, uint32 version, uint64 data_size, uint32 unknown, uint32 header_size
+    uint32_t version = 0;
+    uint64_t data_size64 = 0;
+    uint32_t header_size_v2 = 0;
+    std::memcpy(&version,        p + 4,  sizeof(version));
+    std::memcpy(&data_size64,    p + 8,  sizeof(data_size64));
+    std::memcpy(&header_size_v2, p + 20, sizeof(header_size_v2));
+    if (version == 0x00100001u && header_size_v2 >= 16 && header_size_v2 <= (1u << 20)) {
+        out_size = static_cast<size_t>(data_size64 + static_cast<uint64_t>(header_size_v2));
+        return p;
+    }
+
     // Fatbin header layout (16 bytes):
     //   uint32 magic, uint32 version, uint32 header_size, uint32 data_size
     uint32_t header_size = 0, data_size = 0;

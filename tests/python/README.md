@@ -35,6 +35,11 @@ Comprehensive test suite for Virtual-GPU CUDA interception with PyTorch and CUDA
 - Kernel launch operations
 - Error handling
 
+### pytorch_matmul_demo.py
+- Minimal end-to-end demo script
+- Uses the same LD_PRELOAD interception path as tests
+- Suitable for quick manual validation before running full pytest
+
 ## Quick Start
 
 ### Prerequisites
@@ -84,6 +89,9 @@ python -m pytest tests/python/test_pytorch_conv.py -v
 
 # CUDA Runtime tests only
 python -m pytest tests/python/test_cuda_runtime.py -v
+
+# Run the demo script (not a pytest test)
+python tests/python/pytorch_matmul_demo.py
 ```
 
 ### Run Specific Test

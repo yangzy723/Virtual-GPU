@@ -18,21 +18,39 @@ void KernelRegistry::addKernel(const void* host_fun, KernelEntry entry) {
     func_to_entry_[host_fun] = std::move(entry);
 }
 
-const KernelEntry* KernelRegistry::findKernel(const void* host_fun) const {
+bool KernelRegistry::findKernel(const void* host_fun, KernelEntry* out) const {
+    if (out == nullptr) {
+        return false;
+    }
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = func_to_entry_.find(host_fun);
-    return it != func_to_entry_.end() ? &it->second : nullptr;
+    if (it == func_to_entry_.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
 }
 
-void KernelRegistry::addParamInfo(const std::string& name, std::vector<ParamInfo> params) {
+void KernelRegistry::addParamInfo(uint64_t module_id, const std::string& name, std::vector<ParamInfo> params) {
     std::lock_guard<std::mutex> lk(mutex_);
-    name_to_params_[name] = std::move(params);
+    module_to_params_[module_id][name] = std::move(params);
 }
 
-const std::vector<ParamInfo>* KernelRegistry::findParamInfo(const std::string& name) const {
+bool KernelRegistry::findParamInfo(uint64_t module_id, const std::string& name, std::vector<ParamInfo>* out) const {
+    if (out == nullptr) {
+        return false;
+    }
     std::lock_guard<std::mutex> lk(mutex_);
-    auto it = name_to_params_.find(name);
-    return it != name_to_params_.end() ? &it->second : nullptr;
+    auto mit = module_to_params_.find(module_id);
+    if (mit == module_to_params_.end()) {
+        return false;
+    }
+    auto it = mit->second.find(name);
+    if (it == mit->second.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
 }
 
 void KernelRegistry::addDriverModule(void* cu_mod_handle, uint64_t module_id) {
@@ -51,10 +69,17 @@ void KernelRegistry::addDriverFunc(void* cu_func_handle, KernelEntry entry) {
     drv_func_to_entry_[cu_func_handle] = std::move(entry);
 }
 
-const KernelEntry* KernelRegistry::findDriverFunc(void* cu_func_handle) const {
+bool KernelRegistry::findDriverFunc(void* cu_func_handle, KernelEntry* out) const {
+    if (out == nullptr) {
+        return false;
+    }
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = drv_func_to_entry_.find(cu_func_handle);
-    return it != drv_func_to_entry_.end() ? &it->second : nullptr;
+    if (it == drv_func_to_entry_.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
 }
 
 KernelRegistry& globalKernelRegistry() {

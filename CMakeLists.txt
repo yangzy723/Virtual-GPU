@@ -19,7 +19,6 @@ set(VGPU_COMMON_SOURCES
     src/common/fatbin_parser.cpp
     src/common/kernel_registry.cpp
     src/common/rpc_client.cpp
-    src/common/dlopen_hook.cpp
 )
 
 function(vgpu_configure_shared_target target)
@@ -55,7 +54,14 @@ add_library(vgpu_cudart_shim SHARED
     src/frontend/interceptor.cpp
     ${VGPU_COMMON_SOURCES}
 )
-set_target_properties(vgpu_cudart_shim PROPERTIES OUTPUT_NAME cudart)
+set_target_properties(vgpu_cudart_shim PROPERTIES
+    OUTPUT_NAME cudart
+    VERSION 12.0.0
+    SOVERSION 12
+)
+target_link_options(vgpu_cudart_shim PRIVATE
+    -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/frontend/libcudart.version
+)
 vgpu_configure_shared_target(vgpu_cudart_shim)
 
 add_library(vgpu_cuda_driver_shim SHARED
@@ -86,13 +92,17 @@ target_include_directories(vgpu_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(vgpu_server PRIVATE dl pthread)
 
 if(VGPU_BUILD_TESTS)
-    add_executable(vgpu_runtime_shim_smoke_test test/runtime_shim_smoke_test.cpp)
+    add_executable(vgpu_runtime_shim_smoke_test tests/cpp/runtime_shim_smoke_test.cpp)
     target_include_directories(vgpu_runtime_shim_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(vgpu_runtime_shim_smoke_test PRIVATE vgpu_cudart_shim)
 
+    add_executable(vgpu_runtime_not_supported_semantics_test tests/cpp/runtime_not_supported_semantics_test.cpp)
+    target_include_directories(vgpu_runtime_not_supported_semantics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(vgpu_runtime_not_supported_semantics_test PRIVATE vgpu_cudart_shim)
+
     if(CMAKE_CUDA_COMPILER)
-        vgpu_add_cuda_test(vgpu_runtime_memory_smoke_test test/runtime_memory_smoke_test.cu)
-        vgpu_add_cuda_test(vgpu_runtime_async_event_test test/runtime_async_event_test.cu)
-        vgpu_add_cuda_test(vgpu_runtime_kernel_launch_test test/runtime_kernel_launch_test.cu)
+        vgpu_add_cuda_test(vgpu_runtime_memory_smoke_test tests/cpp/runtime_memory_smoke_test.cu)
+        vgpu_add_cuda_test(vgpu_runtime_async_event_test tests/cpp/runtime_async_event_test.cu)
+        vgpu_add_cuda_test(vgpu_runtime_kernel_launch_test tests/cpp/runtime_kernel_launch_test.cu)
     endif()
 endif()

@@ -64,6 +64,9 @@ bool CudaDriverLoader::ensureLoaded() {
     resolveOptional(handle_, "cuStreamSynchronize",      api_.cuStreamSynchronize);
     resolveOptional(handle_, "cuCtxSynchronize",         api_.cuCtxSynchronize);
     resolveOptional(handle_, "cuFuncGetAttribute",       api_.cuFuncGetAttribute);
+    resolveOptional(handle_, "cuFuncGetParamInfo",       api_.cuFuncGetParamInfo);
+    resolveOptional(handle_, "cuGetErrorName",           api_.cuGetErrorName);
+    resolveOptional(handle_, "cuGetErrorString",         api_.cuGetErrorString);
 
     if (!ok) {
         dlclose(handle_);

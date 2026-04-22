@@ -1,6 +1,7 @@
 #include "vgpu/common/rpc_client.h"
 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -11,6 +12,27 @@
 
 namespace vgpu {
 namespace {
+
+int rpcTimeoutMs() {
+    static int timeout_ms = []() {
+        const char* env = std::getenv("VGPU_RPC_TIMEOUT_MS");
+        if (env == nullptr || env[0] == '\0') {
+            return 30000;
+        }
+
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0) {
+            return 30000;
+        }
+
+        if (parsed > 600000) {
+            return 600000;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return timeout_ms;
+}
 
 bool writeAll(int fd, const void* data, std::size_t len) {
     const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
@@ -71,6 +93,16 @@ const std::string& RpcClient::socketPath() {
 int RpcClient::connectSocket() {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
+        return -1;
+    }
+
+    const int timeout_ms = rpcTimeoutMs();
+    timeval tv{};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        close(fd);
         return -1;
     }
 
