@@ -145,14 +145,18 @@ int main() {
     }
 
     const void* export_table = reinterpret_cast<void*>(0x1);
-    if (!expectResult("cuGetExportTable(default)",
-                      cuGetExportTable(&export_table, kUuid6b),
-                      CUDA_ERROR_NOT_SUPPORTED)) {
+    CUresult export_rc = cuGetExportTable(&export_table, kUuid6b);
+    // With real driver available, cuGetExportTable forwards to the real driver
+    // and returns CUDA_SUCCESS with a valid table. Without a real driver, it
+    // returns CUDA_ERROR_NOT_SUPPORTED and clears the table pointer.
+    if (export_rc == CUDA_ERROR_NOT_SUPPORTED) {
+        if (export_table != nullptr) {
+            std::fprintf(stderr, "default export-table path should clear the table pointer on NOT_SUPPORTED\n");
+            return 12;
+        }
+    } else if (export_rc != CUDA_SUCCESS) {
+        std::fprintf(stderr, "cuGetExportTable(default) unexpected result: %d\n", static_cast<int>(export_rc));
         return 11;
-    }
-    if (export_table != nullptr) {
-        std::fprintf(stderr, "default export-table path should clear the table pointer\n");
-        return 12;
     }
 
     export_success_null.set("1");

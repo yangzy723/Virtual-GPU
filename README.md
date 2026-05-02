@@ -29,10 +29,15 @@ Client-side shim libraries (`libcudart.so.12`, `libcuda.so`, `libvgpu_preload_in
 - `dlopen` / `dlsym` hooks redirect PyTorch and other frameworks to shim libraries
 - Controlled via `LD_PRELOAD` of `libvgpu_preload_init.so`
 
-**Export table stubs**
-- `cuGetProcAddress` / `cuGetProcAddress_v2` with optional symbol exposure
-- `cuGetExportTable` with configurable behavior (not-supported, success-null, fake tables)
-- Controlled via environment variables for framework compatibility probing
+**Real driver passthrough for non-intercepted symbols**
+- `cuGetProcAddress` resolves non-intercepted symbols from the real `libcuda.so.1`
+- `cuGetExportTable` forwards to the real driver when available
+- This lets cuBLAS, cuDNN, and other CUDA libraries function on machines with a real GPU
+
+**PyTorch support**
+- `torch.cuda.is_available()` returns `True`
+- `torch.matmul()` works (via cuBLAS using real driver passthrough)
+- Memory operations (`.cuda()`, `.cpu()`, `torch.zeros` on GPU) work via RPC
 
 ## What Does Not Work
 
@@ -50,11 +55,11 @@ Client-side shim libraries (`libcudart.so.12`, `libcuda.so`, `libvgpu_preload_in
 - Stream memory operations (`cuStreamWaitValue*`, `cuStreamWriteValue*`, `cuStreamBatchMemOp`)
 - Host memory registration (`cudaHostRegister`, `cuMemHostRegister`)
 
-**cuBLAS / cuDNN / NCCL are not proxied.** The export table stubs can satisfy framework initialization probing, but actual cuBLAS GEMM or cuDNN convolution operations will not work. This means:
+**cuBLAS / cuDNN use real driver passthrough, not RPC proxy.** cuBLAS and cuDNN call CUDA Driver API functions (export tables, context management) that are resolved from the real `libcuda.so.1` rather than forwarded through the server. This means:
 
-- `torch.cuda.is_available()` may return `True`
-- `torch.matmul()` on CUDA tensors will fail
-- `torch.nn.Conv2d` forward on CUDA will fail
+- cuBLAS/cuDNN operate against the local GPU directly for internal operations
+- Memory allocation and kernel launch still go through the vGPU server via RPC
+- This is a pragmatic hybrid approach, not a full proxy
 
 **No network transport.** Only Unix Domain Socket on the same machine.
 
@@ -64,8 +69,8 @@ Client-side shim libraries (`libcudart.so.12`, `libcuda.so`, `libvgpu_preload_in
 
 - Ordinary CUDA programs using core Runtime / Driver paths work correctly.
 - Framework initialization that probes optional APIs will see reasonable defaults or explicit `not_supported`, rather than silent misbehavior.
-- PyTorch `torch.cuda` initialization can proceed deep, but compute operations (matmul, conv) are blocked by the lack of cuBLAS / cuDNN proxying.
-- The dlopen hook ensures PyTorch loads shim libraries instead of system CUDA libraries, but this alone does not enable cuBLAS / cuDNN functionality.
+- cuBLAS / cuDNN work via real driver passthrough — they need a real GPU on the same machine.
+- Optional symbols (Graph, capture, occupancy) are hidden by default to prevent frameworks from taking unsupported code paths. Set `VGPU_EXPOSE_OPTIONAL_CUDA_SYMBOLS=1` to expose them.
 
 ## Components
 
@@ -101,7 +106,7 @@ export LD_LIBRARY_PATH=/path/to/vGPU/build:$LD_LIBRARY_PATH
 ./your_cuda_app
 ```
 
-### Run a PyTorch program (limited — no cuBLAS/cuDNN)
+### Run a PyTorch program
 
 ```bash
 export VGPU_SERVER_SOCK=/tmp/vgpu_server.sock
@@ -127,7 +132,11 @@ python your_pytorch_script.py
 ### Python tests
 
 ```bash
+# cuBLAS boundary test (requires running vgpu_server)
 python -m pytest tests/python/test_capability_boundaries.py -v
+
+# torch.matmul end-to-end test (requires running vgpu_server + PyTorch)
+python -m pytest tests/python/test_torch_matmul.py -v
 ```
 
 ### Capability boundary test runner
@@ -150,8 +159,8 @@ bash tests/run_capability_boundaries.sh
 | `VGPU_LOG_CU_GETPROC` | Log `cuGetProcAddress` / `cuGetExportTable` calls |
 | `VGPU_EXPOSE_OPTIONAL_CUDA_SYMBOLS` | Expose optional CUDA symbols via `cuGetProcAddress` |
 | `VGPU_OPTIONAL_SYMBOLS_RETURN_NOT_SUPPORTED` | Optional symbols return `CUDA_ERROR_NOT_SUPPORTED` |
-| `VGPU_USE_FAKE_CU_EXPORT_TABLES` | Enable fake `cuGetExportTable` tables |
-| `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL` | `cuGetExportTable` returns success with null table |
+| `VGPU_USE_FAKE_CU_EXPORT_TABLES` | Force fake `cuGetExportTable` tables (override real driver) |
+| `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL` | Force `cuGetExportTable` to return success with null table |
 
 ## Directory Layout
 
@@ -166,7 +175,7 @@ include/vgpu/
   backend/           Server-side headers
 tests/
   cpp/               C++ boundary and smoke tests
-  python/            Python capability boundary tests
+  python/            Python capability boundary and matmul tests
 ```
 
 ## Design

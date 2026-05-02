@@ -41,6 +41,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "vgpu/common/context_registry.h"
@@ -415,6 +417,71 @@ void* realCudaHandle() {
 
 // fatbinImageSize, resolveRawFatbinPtr, makePackedArgsFromTotalBytes,
 // and makeArgumentSlotsUnknown are now shared in shim_utils.h
+
+// Symbols that our shim intercepts and forwards over RPC.
+// For these, cuGetProcAddress should always return our version.
+// All other symbols are resolved from the real driver when available.
+bool isInterceptedSymbol(const char* symbol) {
+    using namespace std::literals;
+    // Exact matches for specific functions we intercept
+    static const std::unordered_set<std::string_view> exact{
+        // Module loading
+        "cuModuleLoad"sv, "cuModuleLoadData"sv, "cuModuleLoadDataEx"sv,
+        "cuModuleLoadFatBinary"sv, "cuModuleGetFunction"sv, "cuModuleUnload"sv,
+        // Kernel launch
+        "cuLaunchKernel"sv, "cuLaunchHostFunc"sv,
+        // Memory - exact names (non-suffixed versions)
+        "cuMemAlloc"sv, "cuMemAlloc_v2"sv, "cuMemAllocManaged"sv, "cuMemAllocPitch"sv,
+        "cuMemFree"sv, "cuMemFree_v2"sv,
+        "cuMemHostAlloc"sv, "cuMemFreeHost"sv, "cuMemHostGetDevicePointer"sv,
+        "cuMemGetInfo"sv,
+        "cuMemcpyHtoD"sv, "cuMemcpyHtoD_v2"sv,
+        "cuMemcpyDtoH"sv, "cuMemcpyDtoH_v2"sv,
+        "cuMemcpyDtoD"sv, "cuMemcpyDtoD_v2"sv,
+        "cuMemcpy"sv, "cuMemcpyAsync"sv,
+        "cuMemcpyHtoDAsync"sv, "cuMemcpyHtoDAsync_v2"sv,
+        "cuMemcpyDtoHAsync"sv, "cuMemcpyDtoHAsync_v2"sv,
+        "cuMemcpyDtoDAsync"sv, "cuMemcpyDtoDAsync_v2"sv,
+        "cuMemcpyPeer"sv, "cuMemcpyPeerAsync"sv,
+        "cuMemsetD8"sv, "cuMemsetD8_v2"sv, "cuMemsetD32"sv, "cuMemsetD32_v2"sv,
+        "cuMemsetD8Async"sv, "cuMemsetD2D8"sv, "cuMemsetD2D8Async"sv,
+        "cuMemAllocAsync"sv, "cuMemAllocFromPoolAsync"sv, "cuMemFreeAsync"sv,
+        // Stream
+        "cuStreamCreate"sv, "cuStreamCreateWithPriority"sv,
+        "cuStreamDestroy"sv, "cuStreamDestroy_v2"sv,
+        "cuStreamSynchronize"sv, "cuStreamQuery"sv, "cuStreamWaitEvent"sv,
+        "cuStreamGetPriority"sv, "cuStreamGetFlags"sv,
+        "cuStreamGetCtx"sv, "cuStreamGetDevice"sv,
+        "cuStreamAddCallback"sv, "cuStreamGetId"sv,
+        // Event
+        "cuEventCreate"sv, "cuEventDestroy"sv, "cuEventDestroy_v2"sv,
+        "cuEventRecord"sv, "cuEventRecordWithFlags"sv,
+        "cuEventSynchronize"sv, "cuEventQuery"sv, "cuEventElapsedTime"sv,
+        // Context / device
+        "cuInit"sv, "cuCtxCreate"sv, "cuCtxCreate_v2"sv,
+        "cuCtxDestroy"sv, "cuCtxDestroy_v2"sv,
+        "cuCtxGetCurrent"sv, "cuCtxSetCurrent"sv, "cuCtxGetDevice"sv,
+        "cuCtxSynchronize"sv, "cuCtxPopCurrent"sv, "cuCtxPushCurrent"sv,
+        "cuCtxDetach"sv, "cuCtxGetApiVersion"sv, "cuCtxGetFlags"sv,
+        "cuCtxGetLimit"sv, "cuCtxGetCacheConfig"sv, "cuCtxGetSharedMemConfig"sv,
+        "cuCtxGetStreamPriorityRange"sv,
+        "cuDeviceGet"sv, "cuDeviceGetCount"sv, "cuDeviceGetName"sv,
+        "cuDeviceGetAttribute"sv, "cuDeviceTotalMem"sv,
+        "cuDeviceGetP2PAttribute"sv, "cuDeviceGetByPCIBusId"sv,
+        "cuDeviceGetPCIBusId"sv, "cuDeviceGetUuid"sv,
+        "cuDeviceGetTexture1DLinearMaxWidth"sv,
+        "cuDevicePrimaryCtxRetain"sv, "cuDevicePrimaryCtxGetState"sv,
+        // Pointer
+        "cuPointerGetAttribute"sv, "cuPointerGetAttributes"sv,
+        // Misc
+        "cuDriverGetVersion"sv,
+        "cuGetProcAddress"sv, "cuGetProcAddress_v2"sv,
+        "cuGetErrorName"sv, "cuGetErrorString"sv,
+        "cuGetExportTable"sv,
+        "cuDeviceGetDefaultMemPool"sv, "cuDeviceGetMemPool"sv,
+    };
+    return exact.count(symbol) > 0;
+}
 
 }  // namespace
 }  // namespace vgpu
@@ -1779,23 +1846,8 @@ CUresult cuGetExportTable(const void** ppExportTable, const void* pExportTableId
         return CUDA_SUCCESS;
     }
 
-    const char* allow_real = std::getenv("VGPU_ENABLE_REAL_CU_EXPORT_TABLE");
-    const bool use_real = (allow_real != nullptr && allow_real[0] == '1');
-
-    if (!use_real) {
-        if (ppExportTable) {
-            *ppExportTable = nullptr;
-        }
-        if (std::getenv("VGPU_LOG_CU_GETPROC") != nullptr) {
-            std::fprintf(stderr,
-                         "[vgpu-cuGetExportTable] shim rc=%d table=null id=%p uuid=%s\n",
-                         static_cast<int>(CUDA_ERROR_NOT_SUPPORTED),
-                         pExportTableId,
-                         table_uuid);
-        }
-        return CUDA_ERROR_NOT_SUPPORTED;
-    }
-
+    // Default: prefer real driver when available.
+    // Libraries like cuBLAS need real export tables to function.
     void* real = vgpu::realCudaHandle();
     if (real != nullptr) {
         auto* fn = reinterpret_cast<CuGetExportTableFn>(dlsym(real, "cuGetExportTable"));
@@ -1813,6 +1865,7 @@ CUresult cuGetExportTable(const void** ppExportTable, const void* pExportTableId
         }
     }
 
+    // No real driver available — return not supported.
     if (ppExportTable) {
         *ppExportTable = nullptr;
     }
@@ -1861,7 +1914,7 @@ CUresult cuGetProcAddress(const char* symbol,
         return CUDA_SUCCESS;
     }
 
-    // Prefer symbols exported by our own shim first.
+    // Get self-handle (our libcuda.so shim) for symbol lookup.
     static void* self_handle = []() -> void* {
         void* h = dlopen("libcuda.so", RTLD_NOW | RTLD_NOLOAD);
         if (!h) {
@@ -1871,17 +1924,27 @@ CUresult cuGetProcAddress(const char* symbol,
     }();
 
     *pfn = nullptr;
+
+    // Look up in self-handle first.
     if (self_handle) {
         *pfn = dlsym(self_handle, symbol);
-        if (*pfn) resolved_from = "self";
     }
 
-    if (!*pfn) {
-        *pfn = dlsym(RTLD_DEFAULT, symbol);
-        if (*pfn) resolved_from = "default";
-    }
+    const bool intercepted = vgpu::isInterceptedSymbol(symbol);
 
-    if (!*pfn) {
+    if (intercepted) {
+        // For symbols we intercept (memory, launch, module, stream, event,
+        // context, device), always use our shim version.
+        if (*pfn) {
+            resolved_from = "self(intercepted)";
+        } else {
+            // Intercepted symbol not found in self — try RTLD_DEFAULT.
+            *pfn = dlsym(RTLD_DEFAULT, symbol);
+            if (*pfn) resolved_from = "default(intercepted)";
+        }
+    } else {
+        // Non-intercepted symbols: check if they're in the "optional" set
+        // (graph, capture, occupancy, etc.) that we may want to suppress.
         const bool optional_graph = std::strncmp(symbol, "cuGraph", 7) == 0;
         const bool optional_user_obj = std::strncmp(symbol, "cuUserObject", 12) == 0;
         const bool optional_stream_capture =
@@ -1902,31 +1965,55 @@ CUresult cuGetProcAddress(const char* symbol,
             std::strcmp(symbol, "cuMemRangeGetAttribute") == 0 ||
             std::strcmp(symbol, "cuMemRangeGetAttributes") == 0;
 
+        const bool is_optional = (optional_graph || optional_user_obj ||
+                                  optional_stream_capture || optional_misc);
+
         // Strict mode by default: don't advertise unsupported capabilities.
         // Some user-space stacks choose fast paths based on symbol presence
         // and later fail in confusing ways if the symbol only no-ops.
         const char* expose_optional = std::getenv("VGPU_EXPOSE_OPTIONAL_CUDA_SYMBOLS");
         const bool allow_optional = (expose_optional != nullptr && expose_optional[0] == '1');
 
-        if ((optional_graph || optional_user_obj || optional_stream_capture || optional_misc) && allow_optional) {
+        if (is_optional && !allow_optional) {
+            // Optional symbol in strict mode — leave unresolved.
+        } else if (is_optional && allow_optional) {
             const char* optional_not_supported = std::getenv("VGPU_OPTIONAL_SYMBOLS_RETURN_NOT_SUPPORTED");
             const bool use_not_supported = (optional_not_supported != nullptr && optional_not_supported[0] == '1');
             *pfn = use_not_supported
                 ? reinterpret_cast<void*>(&cuNotSupportedStub)
                 : reinterpret_cast<void*>(&cuNoopStub);
             resolved_from = use_not_supported ? "builtin-not-supported" : "builtin-noop";
+        } else {
+            // For all other non-intercepted symbols (export tables, library
+            // APIs, etc.), prefer the real driver so libraries like cuBLAS
+            // can function.
+            void* real = vgpu::realCudaHandle();
+            if (real) {
+                void* real_fn = dlsym(real, symbol);
+                if (real_fn) {
+                    *pfn = real_fn;
+                    resolved_from = "real";
+                }
+            }
+            // Fall back to self-handle result if real driver didn't have it.
+            if (!*pfn && self_handle) {
+                *pfn = dlsym(self_handle, symbol);
+                if (*pfn) resolved_from = "self";
+            }
+            if (!*pfn) {
+                *pfn = dlsym(RTLD_DEFAULT, symbol);
+                if (*pfn) resolved_from = "default";
+            }
         }
     }
 
-    // Keep real-libcuda fallback opt-in: for remote interception flows,
-    // resolving unknown entries to a local real driver often causes init
-    // failures on machines without matching local GPUs.
+    // Opt-in: fallback to real driver for any remaining unresolved symbols.
     const char* allow_real_fallback = std::getenv("VGPU_ENABLE_REAL_CUDA_FALLBACK");
     if (!*pfn && allow_real_fallback && allow_real_fallback[0] == '1') {
         void* real = vgpu::realCudaHandle();
         if (real) {
             *pfn = dlsym(real, symbol);
-            if (*pfn) resolved_from = "real";
+            if (*pfn) resolved_from = "real(fallback)";
         }
     }
 

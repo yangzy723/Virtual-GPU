@@ -199,16 +199,29 @@ Key implementation details:
 - Falls back to loading the original library if shim loading fails.
 - Debug logging controlled by `VGPU_DEBUG` environment variable.
 
-## 10. Export Table Stubs
+## 10. Export Table and Symbol Resolution
 
-`cuGetExportTable` returns stub function tables for specific UUIDs (cuBLAS, cuDNN). This satisfies framework initialization probing without providing real functionality.
+### 10.1 cuGetProcAddress — Symbol Resolution Strategy
 
-Three modes controlled by environment variables:
-- **Default**: Returns `CUDA_ERROR_NOT_SUPPORTED`, clears table pointer.
-- **Success-null** (`VGPU_CU_EXPORT_TABLE_SUCCESS_NULL`): Returns `CUDA_SUCCESS` with null table.
-- **Fake tables** (`VGPU_USE_FAKE_CU_EXPORT_TABLES`): Returns `CUDA_SUCCESS` with stub function pointers.
+`cuGetProcAddress` resolves CUDA Driver API symbols using a two-tier strategy:
 
-This allows frameworks to initialize without crashing, while making it clear that actual cuBLAS/cuDNN operations are not supported.
+**Intercepted symbols** (memory, kernel launch, modules, streams, events, context, device management): Always resolved from the shim's own `libcuda.so`. These are the operations forwarded over RPC to the server.
+
+**Non-intercepted symbols** (export tables, library internals, cuBLAS/cuDNN APIs): Resolved from the real `libcuda.so.1` loaded via `realCudaHandle()`. This lets CUDA libraries like cuBLAS access real driver internals while our intercepted operations remain under RPC control.
+
+The real `libcuda.so.1` is loaded with `RTLD_LOCAL`, so its internal function calls use its own GOT and do not re-enter the shim. This prevents circular interception.
+
+**Optional symbols** (Graph, stream capture, occupancy, etc.): Controlled by `VGPU_EXPOSE_OPTIONAL_CUDA_SYMBOLS`. In strict mode (default), these are not resolved, preventing frameworks from taking unsupported code paths.
+
+### 10.2 cuGetExportTable — Export Table Forwarding
+
+`cuGetExportTable` forwards to the real driver by default when `realCudaHandle()` is available. This is necessary because cuBLAS requires real export tables to function.
+
+Priority order:
+1. `VGPU_USE_FAKE_CU_EXPORT_TABLES=1` — explicit override, use fake tables
+2. `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL=1` — explicit override, return null
+3. Real driver available — forward to real `cuGetExportTable` (default)
+4. No real driver — return `CUDA_ERROR_NOT_SUPPORTED`
 
 ## 11. Current Limitations and Future Work
 
@@ -231,10 +244,10 @@ This allows frameworks to initialize without crashing, while making it clear tha
 
 The most likely source of drift is documentation not matching implementation. README capability claims, DESIGN compatibility strategy, and test assertions should be maintained together.
 
-### 11.4 No cuBLAS / cuDNN proxy
+### 11.4 cuBLAS / cuDNN via real driver passthrough
 
-The largest gap for PyTorch support. Closing this would require either:
-- Proxying cuBLAS/cuDNN calls through the server (significant effort).
-- Or providing stub implementations that perform computation on the server side.
+cuBLAS and cuDNN work through a hybrid approach: their internal CUDA Driver API calls (export tables, context management) are resolved from the real `libcuda.so.1`, while memory allocation and kernel launch go through the vGPU server via RPC.
+
+This is not a full proxy — cuBLAS/cuDNN use the real driver for internal operations directly. The benefit is that cuBLAS/cuDNN work out of the box without implementing RPC proxies for their complex internal APIs. The limitation is that they require a real GPU on the same machine.
 
 Currently, export table stubs only satisfy initialization probing, not actual computation.
