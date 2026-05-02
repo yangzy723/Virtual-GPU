@@ -96,9 +96,31 @@ if(VGPU_BUILD_TESTS)
     target_include_directories(vgpu_runtime_shim_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(vgpu_runtime_shim_smoke_test PRIVATE vgpu_cudart_shim)
 
+    add_executable(vgpu_driver_capability_boundary_test tests/cpp/driver_capability_boundary_test.cpp)
+    target_include_directories(vgpu_driver_capability_boundary_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(vgpu_driver_capability_boundary_test PRIVATE vgpu_cuda_driver_shim)
+
+    add_executable(vgpu_runtime_capability_boundary_test tests/cpp/runtime_capability_boundary_test.cpp)
+    target_include_directories(vgpu_runtime_capability_boundary_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(vgpu_runtime_capability_boundary_test PRIVATE vgpu_cudart_shim)
+
     add_executable(vgpu_runtime_not_supported_semantics_test tests/cpp/runtime_not_supported_semantics_test.cpp)
     target_include_directories(vgpu_runtime_not_supported_semantics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(vgpu_runtime_not_supported_semantics_test PRIVATE vgpu_cudart_shim)
+
+    add_custom_target(vgpu_capability_boundary_tests
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_capability_boundaries.sh
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        DEPENDS
+            vgpu_server
+            vgpu_preload_init
+            vgpu_cuda_driver_shim
+            vgpu_cudart_shim
+            vgpu_driver_capability_boundary_test
+            vgpu_runtime_capability_boundary_test
+            vgpu_runtime_not_supported_semantics_test
+        USES_TERMINAL
+    )
 
     if(CMAKE_CUDA_COMPILER)
         vgpu_add_cuda_test(vgpu_runtime_memory_smoke_test tests/cpp/runtime_memory_smoke_test.cu)

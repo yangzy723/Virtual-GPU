@@ -1,29 +1,27 @@
 # Virtual-GPU Design
 
-## 1. 目标
+## 1. Goal
 
-Virtual-GPU 的目标是把客户端进程中的 CUDA Runtime / Driver API 调用，透明地转发给本机另一个持有真实 GPU 的服务进程执行。
+Virtual-GPU transparently forwards CUDA Runtime and Driver API calls from a client process to a server process on the same machine that holds the real GPU.
 
-当前设计关注三件事：
+Design priorities:
 
-1. 打通高频主路径。
-2. 保持 Runtime 和 Driver 两条入口都可用。
-3. 让代码结构足够清晰，便于后续继续补齐框架兼容性。
+1. Support the high-frequency core path: memory allocation, memcpy, kernel launch.
+2. Maintain both Runtime and Driver API entry points.
+3. Keep code structure clear for incremental improvement.
 
-## 2. 非目标
+## 2. Non-Goals
 
-当前实现不是以下方向的完整方案：
+- Full CUDA compatibility layer
+- Distributed multi-machine GPU scheduling
+- cuBLAS / cuDNN / NCCL proxy layers
+- Complete CUDA Graph / IPC / Peer Access / VMM semantics
 
-- 不是完整的 CUDA 兼容层。
-- 不是分布式多机 GPU 调度系统。
-- 不是完整的 cuBLAS / cuDNN / NCCL 专用代理层。
-- 不是完整的 CUDA Graph / IPC / Peer Access / VMM 语义实现。
-
-## 3. 系统总览
+## 3. System Overview
 
 ```mermaid
 flowchart LR
-    subgraph ClientProcess[客户端进程]
+    subgraph Client[Client Process]
         APP[CUDA App / PyTorch]
         PRELOAD[libvgpu_preload_init.so]
         RT[libcudart.so.12 shim]
@@ -33,7 +31,7 @@ flowchart LR
         APP --> DRV
     end
 
-    subgraph SharedCode[共享组件]
+    subgraph Shared[Shared Components]
         PROTO[protocol.h]
         RPC[rpc_client.cpp]
         FATBIN[fatbin_parser.cpp]
@@ -41,16 +39,16 @@ flowchart LR
         CREG[context_registry.cpp]
     end
 
-    subgraph ServerProcess[服务端进程]
+    subgraph Server[Server Process]
         SERVER[vgpu_server]
         DISPATCH[server_main.cpp]
         RTL[cuda_runtime_loader.cpp]
         DRVL[cuda_driver_loader.cpp]
-        REAL[真实 CUDA 库]
+        REAL[Real CUDA libs]
         GPU[NVIDIA GPU]
         SERVER --> DISPATCH
-        SERVER --> RTL
-        SERVER --> DRVL
+        DISPATCH --> RTL
+        DISPATCH --> DRVL
         RTL --> REAL
         DRVL --> REAL
         REAL --> GPU
@@ -59,260 +57,184 @@ flowchart LR
     RT --> RPC
     DRV --> RPC
     RPC --> SERVER
-    FATBIN --> RT
-    FATBIN --> DRV
-    KREG --> RT
-    KREG --> DRV
-    CREG --> RT
-    CREG --> DRV
-    PROTO --> RT
-    PROTO --> DRV
-    PROTO --> SERVER
 ```
 
-## 4. 分层与职责
+## 4. Layers and Responsibilities
 
 ### 4.1 Frontend
 
-Frontend 运行在客户端进程内，负责导出 shim 符号、收集参数、构造 RPC 请求、处理服务端响应。
+Runs in the client process. Exports shim symbols, collects parameters, constructs RPC requests, handles responses.
 
-关键文件：
+**Key files:**
 
-- src/frontend/interceptor.cpp
-  - Runtime API 入口。
-  - 负责 cudaMalloc、cudaMemcpy、cudaLaunchKernel 等路径。
-  - 负责 __cudaRegisterFatBinary 和 __cudaRegisterFunction，接住 NVCC 的 fatbin 注册流程。
-- src/frontend/driver_interceptor.cpp
-  - Driver API 入口。
-  - 负责 cuModuleLoadData、cuModuleGetFunction、cuLaunchKernel 以及常见设备 / 上下文 / 流 / 事件接口。
-- src/common/dlopen_hook.cpp
-  - 劫持 dlopen / dlsym。
-  - 让 PyTorch 等动态加载用户态 CUDA 库的框架优先落到本仓库 shim。
-- src/common/cuda_preload_init.cpp
-  - 负责 preload 初始化时机控制。
+- `src/frontend/interceptor.cpp` — Runtime API entry point. Handles `cudaMalloc`, `cudaMemcpy`, `cudaLaunchKernel`, `__cudaRegisterFatBinary`, `__cudaRegisterFunction`.
+- `src/frontend/driver_interceptor.cpp` — Driver API entry point. Handles `cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`, device/context/stream/event interfaces.
+- `src/common/dlopen_hook.cpp` — Interposes `dlopen` / `dlsym` to redirect framework library loading to shim libraries.
+- `src/common/cuda_preload_init.cpp` — Preload initialization timing.
+
+**Compatibility strategy:** Frontend functions fall into three categories:
+
+1. **Full forwarding** — Parameters encoded and sent to server (e.g., `cudaMalloc`, `cudaLaunchKernel`).
+2. **Compatibility stubs** — Return success with reasonable defaults for framework probing (e.g., `cudaGetDeviceProperties` returns a plausible device profile).
+3. **Explicit not-supported** — Return `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` for capabilities that are genuinely absent (IPC, Graph, MemPool, UVM, etc.).
+
+The boundary between categories 2 and 3 is: if returning success would cause the framework to proceed with a code path that silently produces wrong results, return not-supported instead.
 
 ### 4.2 Common
 
-Common 是前后端共享的协议和元数据层。
+Shared protocol and metadata layer between frontend and backend.
 
-关键文件：
+**Key files:**
 
-- include/vgpu/common/protocol.h
-  - 定义 RpcOp、RpcDrvOp、请求头、响应头以及 payload 结构。
-- src/common/rpc_client.cpp
-  - 实现 Unix Domain Socket RPC client。
-  - 处理连接、超时、读写完整性。
-- src/common/fatbin_parser.cpp
-  - 从 fatbin / PTX 中提取 kernel 参数布局。
-- src/common/kernel_registry.cpp
-  - 维护 module、function、参数布局、fake handle 到 server id 的映射。
-- src/common/context_registry.cpp
-  - 维护与 device 绑定的 context id 分配逻辑。
+- `include/vgpu/common/protocol.h` — Defines `RpcOp`, `RpcDrvOp`, request/response headers, payload structures.
+- `src/common/rpc_client.cpp` — Unix Domain Socket RPC client with connection management and timeout handling.
+- `src/common/fatbin_parser.cpp` — Extracts kernel parameter layout from fatbin / PTX images.
+- `src/common/kernel_registry.cpp` — Maps fake handles to server-side module/function IDs; caches parameter layouts.
+- `src/common/context_registry.cpp` — Allocates stable context IDs per device.
+- `include/vgpu/frontend/shim_utils.h` — Shared frontend helpers: fatbin image parsing, argument packing, `/proc/self/maps` access checks, environment variable utilities.
 
 ### 4.3 Backend
 
-Backend 运行在服务端进程中，负责接收请求、分发执行、调用真实 CUDA 库。
+Runs in the server process. Receives RPC requests, dispatches to real CUDA libraries.
 
-关键文件：
+**Key files:**
 
-- src/backend/server_main.cpp
-  - 服务端入口。
-  - 负责 socket accept、按连接处理请求、Runtime/Driver 分发。
-- src/backend/cuda_runtime_loader.cpp
-  - 动态加载真实 libcudart.so，解析所需符号。
-- src/backend/cuda_driver_loader.cpp
-  - 动态加载真实 libcuda.so，解析所需符号。
+- `src/backend/server_main.cpp` — Server entry point. Socket accept, per-connection request handling, Runtime/Driver dispatch.
+- `src/backend/cuda_runtime_loader.cpp` — Dynamically loads real `libcudart.so`, resolves symbols.
+- `src/backend/cuda_driver_loader.cpp` — Dynamically loads real `libcuda.so`, resolves symbols.
 
-## 5. 关键实现路径
+## 5. Key Execution Paths
 
-### 5.1 Runtime 内存操作
+### 5.1 Memory Operations
 
-以 cudaMemcpy 为例：
+Using `cudaMemcpy` (H2D) as an example:
 
-1. 应用调用 cudaMemcpy。
-2. frontend 将参数编码为 RpcMemcpyReq。
-3. H2D 时把 host 数据作为 extra payload 发给服务端。
-4. 服务端解码后调用真实 cudaMemcpy。
-5. D2H 时服务端把结果作为 payload 回传。
-6. frontend copy back 到调用者提供的 host 缓冲区。
+1. Application calls `cudaMemcpy(dst, src, count, cudaMemcpyHostToDevice)`.
+2. Frontend encodes parameters as `RpcMemcpyReq`.
+3. Host source data sent as extra payload.
+4. Server decodes and calls real `cudaMemcpy`.
+5. Server returns status.
+6. For D2H direction, server sends result data back as payload; frontend copies to caller's buffer.
 
-这个路径的特点是：
+### 5.2 Runtime Kernel Launch
 
-- Runtime 语义保持简单直通。
-- 请求体固定，数据体可选。
-- D2H 方向在客户端有一次额外 copy back。
+The most critical Runtime path:
 
-### 5.2 Runtime kernel launch
+1. NVCC triggers `__cudaRegisterFatBinary` at program startup or module load.
+2. Frontend uploads fatbin to server, receives `module_id`.
+3. Frontend uses `fatbin_parser` to extract parameter layout, caches in `kernel_registry`.
+4. `__cudaRegisterFunction` exchanges function name for `func_id` with server.
+5. At `cudaLaunchKernel` time, frontend packs `void** args` into contiguous buffer using cached `ParamInfo`.
+6. Request sent as `RpcCuLaunchKernelReq` + argument buffer.
+7. Server calls real `cuLaunchKernel`.
 
-这是 Runtime 侧最关键的路径。
+Parameter metadata is resolved at registration time to minimize overhead at launch time.
 
-1. NVCC 在程序启动或模块加载时触发 __cudaRegisterFatBinary。
-2. frontend 把 fatbin 上传到服务端，获得 module_id。
-3. frontend 用 fatbin_parser 解析本地参数信息，并缓存到 kernel_registry。
-4. __cudaRegisterFunction 再根据函数名向服务端换取 func_id。
-5. 真正执行 cudaLaunchKernel 时，frontend 根据 ParamInfo 把 void** args 打包成连续 buffer。
-6. 请求通过 RpcCuLaunchKernelReq + arg buffer 发送给服务端。
-7. 服务端调用真实 cuLaunchKernel 执行。
+### 5.3 Driver Direct Path
 
-当前设计里，参数元数据尽量前置到注册阶段，以减少真正 launch 时的解析成本。
+Using `cuModuleLoadData` -> `cuModuleGetFunction` -> `cuLaunchKernel`:
 
-### 5.3 Driver 直通路径
+1. Driver shim forwards fatbin to server as-is.
+2. Server loads module, returns `module_id`.
+3. Frontend creates a fake `CUmodule` handle, records fake-to-server mapping in `kernel_registry`.
+4. `cuModuleGetFunction` exchanges for `func_id`, creates fake `CUfunction` handle.
+5. `cuLaunchKernel` looks up `func_id` and parameter layout from local registry, forwards to server.
 
-以 cuModuleLoadData -> cuModuleGetFunction -> cuLaunchKernel 为例：
+Core principle: client exposes only fake handles; server holds real `CUmodule` / `CUfunction`; registry bridges the two.
 
-1. Driver shim 将 fatbin 原样转发给服务端。
-2. 服务端 load module 后返回 module_id。
-3. frontend 本地创建 fake CUmodule handle，并记住 fake handle 到 module_id 的映射。
-4. cuModuleGetFunction 时同理换取 func_id，并创建 fake CUfunction handle。
-5. cuLaunchKernel 时从本地 registry 找出 func_id 和参数布局，然后转发给服务端执行。
+## 6. Handle and Context Model
 
-这里的核心思想是：
+### 6.1 Fake Handles
 
-- 客户端只暴露 fake handle。
-- 服务端持有真实 CUmodule / CUfunction。
-- 两侧通过 registry 建立映射关系。
+Many client-side handles are shim-generated fakes:
 
-## 6. 句柄与上下文模型
+- Prevents server-side real pointers from leaking to client.
+- Maintains unified local handle model across Runtime and Driver entries.
+- Enables registry lookup for `module_id` / `func_id` / parameter info in subsequent calls.
 
-### 6.1 fake handle
+### 6.2 Context IDs
 
-客户端的很多句柄并不是真实 CUDA 句柄，而是 shim 生成的 fake handle，用于：
+`ContextRegistry` does not create real CUDA contexts on the client. It allocates stable `context_id` values to:
 
-- 避免把服务端真实指针暴露回客户端。
-- 在 Runtime / Driver 两条入口上维持统一的本地句柄模型。
-- 让 registry 能够在后续调用中查回 module_id / func_id / 参数信息。
+- Organize requests by device dimension.
+- Provide consistent request identifiers shared by Runtime and Driver paths.
+- Improve server-side log correlation.
 
-### 6.2 context id
+## 7. Protocol
 
-ContextRegistry 不是在客户端真实创建完整 CUDA context，而是为请求流分配稳定的 context_id，用于：
+Two core enums in `protocol.h`:
 
-- 把请求按 device 维度组织起来。
-- 让服务端日志和状态关联更明确。
-- 让 Runtime/Driver 两条链路共享统一的请求标识方式。
+- `RpcOp` — Runtime main paths and common queries.
+- `RpcDrvOp` — Driver module, memory, launch paths.
 
-## 7. 协议设计
+**Request:**
+- `RpcRequestHeader` (magic, version, op, app_id, context_id, device, payload_size)
+- Payload
+- Optional extra payload
 
-protocol.h 中的协议有两个核心枚举：
+**Response:**
+- `RpcResponseHeader` (status, aux_u64, payload_size)
+- Payload
 
-- RpcOp
-  - 代表 Runtime 主路径和部分公共查询路径。
-- RpcDrvOp
-  - 代表 Driver 模块、内存、launch 等路径。
+`aux_u64` commonly returns: device count, stream/event pointers, module_id/func_id.
 
-每次请求包含：
+## 8. Fatbin Image Handling
 
-- RpcRequestHeader
-  - magic
-  - version
-  - op
-  - app_id
-  - context_id
-  - device
-  - payload_size
-- payload
-- optional extra payload
+Fatbin images have two formats:
 
-每次响应包含：
+- **Wrapper magic** (`0x466243B1`): 8-byte header followed by pointer to actual fatbin data.
+- **Fatbin magic** (`0xBA55ED50`): Direct fatbin data with header containing size information.
 
-- RpcResponseHeader
-  - status
-  - aux_u64
-  - payload_size
-- payload
+CUDA 12+ uses an extended header: `u32 magic, u32 version, u64 data_size, u32 unknown, u32 header_size`. Legacy layout uses `u32 header_size @8, u32 data_size @12`.
 
-其中 aux_u64 常用于返回：
+Parsing logic is in `shim_utils.h` (`resolveRawFatbinPtr`, `fatbinImageSize`), shared between Runtime and Driver shims.
 
-- device count
-- stream / event / fake pointer
-- module_id / func_id
+## 9. dlopen Interception
 
-## 8. 兼容策略
+`dlopen_hook.cpp` interposes the system `dlopen` and `dlsym` symbols using `LD_PRELOAD`. When a process attempts to load `libcuda.so` or `libcudart.so`, the hook redirects to the shim libraries instead.
 
-当前实现没有把所有 API 都做成“真实语义完整代理”，而是区分三类：
+Key implementation details:
+- Uses `dlvsym(RTLD_NEXT, ...)` with `GLIBC_2.2.5` to resolve the original `dlopen` without recursion.
+- Thread-local reentrancy guard prevents infinite recursion.
+- Falls back to loading the original library if shim loading fails.
+- Debug logging controlled by `VGPU_DEBUG` environment variable.
 
-### 8.1 完整转发
+## 10. Export Table Stubs
 
-例如：
+`cuGetExportTable` returns stub function tables for specific UUIDs (cuBLAS, cuDNN). This satisfies framework initialization probing without providing real functionality.
 
-- cudaMalloc / cudaFree
-- cudaMemcpy*
-- cudaMemset*
-- cuModuleLoadData
-- cuModuleGetFunction
-- cuLaunchKernel
+Three modes controlled by environment variables:
+- **Default**: Returns `CUDA_ERROR_NOT_SUPPORTED`, clears table pointer.
+- **Success-null** (`VGPU_CU_EXPORT_TABLE_SUCCESS_NULL`): Returns `CUDA_SUCCESS` with null table.
+- **Fake tables** (`VGPU_USE_FAKE_CU_EXPORT_TABLES`): Returns `CUDA_SUCCESS` with stub function pointers.
 
-### 8.2 兼容性 stub
+This allows frameworks to initialize without crashing, while making it clear that actual cuBLAS/cuDNN operations are not supported.
 
-例如一些框架初始化时会探测，但不一定在主路径上依赖其完整语义的接口。
-这些接口可能返回：
+## 11. Current Limitations and Future Work
 
-- success + 合理默认值
-- not supported
+### 11.1 Frontend files are large
 
-设计目的不是伪装完全支持，而是避免无意义地卡死在框架探测阶段。
+`interceptor.cpp` and `driver_interceptor.cpp` each contain core forwarding logic, compatibility stubs, and debug diagnostics in a single file. A natural next step would be splitting each into:
+- Core forwarding functions
+- Compatibility stubs
+- Debug / diagnostic helpers
 
-### 8.3 明确 not supported
+### 11.2 Server dispatch is monolithic
 
-例如当前已确认不应假装成功的路径：
+`server_main.cpp` handles all request types in one dispatch function. Could be split into:
+- Runtime memory operations
+- Runtime stream/event operations
+- Driver module operations
+- Driver memory operations
 
-- IPC
-- 多数 Graph 相关接口
-- MemPool 的完整语义
+### 11.3 Capability matrix should track tests
 
-这些路径显式返回 not supported，避免 silent wrong behavior。
+The most likely source of drift is documentation not matching implementation. README capability claims, DESIGN compatibility strategy, and test assertions should be maintained together.
 
-## 9. 当前代码整理结果
+### 11.4 No cuBLAS / cuDNN proxy
 
-本轮整理没有改变协议，也没有重写执行路径，重点是先降低重复样板：
+The largest gap for PyTorch support. Closing this would require either:
+- Proxying cuBLAS/cuDNN calls through the server (significant effort).
+- Or providing stub implementations that perform computation on the server side.
 
-- 新增 include/vgpu/frontend/shim_utils.h
-  - 统一前端 shim 里的环境变量布尔开关判断。
-  - 统一 /proc/self/maps 的可读 / 可写地址区间检查逻辑。
-- runtime 和 driver shim 不再各自维护重复的进程地址区间扫描代码。
-
-这样做的原因很直接：
-
-- 这类逻辑跨文件重复但与业务语义无关。
-- 抽出来后不改 RPC、不改协议、不改执行路径，风险最低。
-- 后续继续整理时，可以沿着“先抽公共 helper，再拆业务模块”的方向推进。
-
-## 10. 当前代码中仍值得继续整理的点
-
-### 10.1 Frontend 文件仍然偏大
-
-interceptor.cpp 和 driver_interceptor.cpp 仍同时包含：
-
-- 核心转发逻辑
-- 大量兼容 stub
-- 调试与诊断逻辑
-
-下一步更合理的拆法是：
-
-- runtime 核心路径
-- runtime 兼容 stub
-- driver 核心路径
-- driver 兼容 stub
-
-### 10.2 server_main.cpp 仍然承担过多分发职责
-
-虽然相比早期版本已经拆出多个 helper，但仍然适合继续收缩为更明确的模块边界：
-
-- runtime memory
-- runtime stream/event
-- driver module
-- driver memory
-
-### 10.3 能力矩阵需要持续和测试保持一致
-
-当前最容易失真的不是代码，而是文档口径。因此 README 和 DESIGN 必须跟 tests/python、tests/cpp 一起维护。
-
-## 11. 演进建议
-
-后续如果继续整理，建议顺序如下：
-
-1. 继续抽掉 frontend 中重复的小工具和兼容 stub。
-2. 继续收缩 backend 分发函数的体积。
-3. 为 README 增加更细粒度的 API 能力矩阵。
-4. 在测试中补一组“能力边界回归测试”，专门验证哪些接口应 success、哪些应 not supported。
-
-这个顺序的优点是：每一步都能单独验证，且不会把当前已经打通的主路径重新打乱。
+Currently, export table stubs only satisfy initialization probing, not actual computation.

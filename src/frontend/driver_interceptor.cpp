@@ -49,7 +49,6 @@
 #include "vgpu/frontend/shim_utils.h"
 #include "vgpu/common/fatbin_parser.h"
 #include "vgpu/common/kernel_registry.h"
-#include <fstream>
 #include "vgpu/common/protocol.h"
 #include "vgpu/common/rpc_client.h"
 
@@ -414,170 +413,8 @@ void* realCudaHandle() {
     return handle;
 }
 
-// ── Fatbin image size detection ──────────────────────────────────────────────
-// Returns total byte size of the raw fatbin image (magic 0xBA55ED50).
-// If the pointer is to a wrapper struct (magic 0x466243B1), follows it first.
-size_t fatbinImageSize(const void* image) {
-    if (!image) return 0;
-    static constexpr uint32_t kWrapMagic = 0x466243B1u;
-    static constexpr uint32_t kFatMagic  = 0xBA55ED50u;
-
-    const uint8_t* p = static_cast<const uint8_t*>(image);
-    uint32_t magic = 0;
-    std::memcpy(&magic, p, sizeof(magic));
-
-    if (magic == kWrapMagic) {
-        const void* data = nullptr;
-        std::memcpy(&data, p + 8, sizeof(data));
-        if (!data) return 0;
-        p = static_cast<const uint8_t*>(data);
-        std::memcpy(&magic, p, sizeof(magic));
-    }
-    if (magic != kFatMagic) return 0;
-
-    // CUDA 12+ fatbin header variant:
-    //   u32 magic, u32 version, u64 data_size, u32 unknown, u32 header_size
-    uint32_t version = 0;
-    uint64_t data_size64 = 0;
-    uint32_t header_size_v2 = 0;
-    std::memcpy(&version,        p + 4,  sizeof(version));
-    std::memcpy(&data_size64,    p + 8,  sizeof(data_size64));
-    std::memcpy(&header_size_v2, p + 20, sizeof(header_size_v2));
-    if (version == 0x00100001u && header_size_v2 >= 16 && header_size_v2 <= (1u << 20)) {
-        size_t total_v2 = static_cast<size_t>(data_size64 + static_cast<uint64_t>(header_size_v2));
-        if (total_v2 >= header_size_v2) {
-            return total_v2;
-        }
-    }
-
-    uint32_t hdr_size = 0, data_size = 0;
-    std::memcpy(&hdr_size,  p + 8,  sizeof(hdr_size));
-    std::memcpy(&data_size, p + 12, sizeof(data_size));
-    return static_cast<size_t>(hdr_size) + static_cast<size_t>(data_size);
-}
-
-// Follow wrapper → raw if needed; return pointer to raw fatbin
-const void* resolveRawFatbin(const void* image) {
-    static constexpr uint32_t kWrapMagic = 0x466243B1u;
-    if (!image) return nullptr;
-    const uint8_t* p = static_cast<const uint8_t*>(image);
-    uint32_t magic = 0;
-    std::memcpy(&magic, p, sizeof(magic));
-    if (magic == kWrapMagic) {
-        const void* data = nullptr;
-        std::memcpy(&data, p + 8, sizeof(data));
-        return data;
-    }
-    return image;
-}
-
-std::vector<std::uint8_t> makePackedArgsFromTotalBytes(void** kernelParams, uint32_t total_param_bytes) {
-    std::vector<std::uint8_t> out;
-    if (kernelParams == nullptr || total_param_bytes == 0) {
-        return out;
-    }
-
-    out.assign(total_param_bytes, 0);
-    const size_t slot = sizeof(std::uint64_t);
-    size_t max_args = (static_cast<size_t>(total_param_bytes) + slot - 1) / slot;
-    if (max_args > 64) {
-        max_args = 64;
-    }
-
-    for (size_t i = 0; i < max_args; ++i) {
-        void* arg_ptr = kernelParams[i];
-        if (arg_ptr == nullptr && i > 0) {
-            break;
-        }
-        if (arg_ptr == nullptr) {
-            continue;
-        }
-
-        const size_t off = i * slot;
-        if (off >= out.size()) {
-            break;
-        }
-        const size_t n = std::min(slot, out.size() - off);
-        std::memcpy(out.data() + off, arg_ptr, n);
-    }
-
-    return out;
-}
-
-std::vector<std::uint8_t> makeArgumentSlotsUnknown(void** kernelParams, size_t max_slots = 12) {
-    auto isReadable = [](const void* p, size_t len) -> bool {
-        if (p == nullptr || len == 0) {
-            return false;
-        }
-
-        struct Range { std::uintptr_t lo; std::uintptr_t hi; };
-        static thread_local std::vector<Range> ranges;
-        static thread_local bool loaded = false;
-        if (!loaded) {
-            loaded = true;
-            std::ifstream maps("/proc/self/maps");
-            std::string line;
-            while (std::getline(maps, line)) {
-                if (line.size() < 20) {
-                    continue;
-                }
-                size_t dash = line.find('-');
-                size_t sp = line.find(' ');
-                if (dash == std::string::npos || sp == std::string::npos || dash >= sp) {
-                    continue;
-                }
-                if (sp + 1 >= line.size() || line[sp + 1] != 'r') {
-                    continue;
-                }
-                std::uintptr_t lo = static_cast<std::uintptr_t>(std::strtoull(line.substr(0, dash).c_str(), nullptr, 16));
-                std::uintptr_t hi = static_cast<std::uintptr_t>(std::strtoull(line.substr(dash + 1, sp - dash - 1).c_str(), nullptr, 16));
-                if (lo < hi) {
-                    ranges.push_back({lo, hi});
-                }
-            }
-        }
-
-        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(p);
-        const std::uintptr_t end = addr + len;
-        if (end < addr) {
-            return false;
-        }
-        for (const auto& r : ranges) {
-            if (addr >= r.lo && end <= r.hi) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    std::vector<std::uint8_t> out;
-    if (kernelParams == nullptr || max_slots == 0) {
-        return out;
-    }
-
-    const size_t slot = sizeof(std::uint64_t);
-    out.assign(max_slots * slot, 0);
-
-    size_t used = 0;
-    for (size_t i = 0; i < max_slots; ++i) {
-        void* arg_ptr = kernelParams[i];
-        if (arg_ptr == nullptr && i > 0) {
-            break;
-        }
-        if (arg_ptr == nullptr) {
-            used = i + 1;
-            continue;
-        }
-        if (!isReadable(arg_ptr, slot)) {
-            break;
-        }
-        std::memcpy(out.data() + i * slot, arg_ptr, slot);
-        used = i + 1;
-    }
-
-    out.resize(used * slot);
-    return out;
-}
+// fatbinImageSize, resolveRawFatbinPtr, makePackedArgsFromTotalBytes,
+// and makeArgumentSlotsUnknown are now shared in shim_utils.h
 
 }  // namespace
 }  // namespace vgpu
@@ -697,6 +534,7 @@ CUresult cuDeviceGetTexture1DLinearMaxWidth(size_t* maxWidth,
                                             int /*format*/,
                                             unsigned int /*numChannels*/,
                                             CUdevice /*dev*/) {
+    // This is a query-only function that returns a reasonable default
     if (maxWidth) *maxWidth = static_cast<size_t>(1) << 27;
     return CUDA_SUCCESS;
 }
@@ -707,7 +545,8 @@ CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice /*dev*/) {
 }
 
 CUresult cuDeviceSetMemPool(CUdevice /*dev*/, void* /*pool*/) {
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuDeviceGetMemPool(void** pool, CUdevice /*dev*/) {
@@ -716,7 +555,8 @@ CUresult cuDeviceGetMemPool(void** pool, CUdevice /*dev*/) {
 }
 
 CUresult cuFlushGPUDirectRDMAWrites(int /*target*/, int /*scope*/) {
-    return CUDA_SUCCESS;
+    // GPUDirect RDMA operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuDeviceTotalMem_v2(size_t* bytes, CUdevice /*dev*/) {
@@ -735,6 +575,8 @@ CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
 // ── Context (stub – no real context on client) ───────────────────────────────
 
 CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int /*flags*/, CUdevice dev) {
+    // Context creation is not fully supported in remote mode
+    // but we allow it for compatibility
     vgpu::g_drv_device = static_cast<int>(dev);
     using CuInitFn = CUresult (*)(unsigned int);
     using CuDeviceGetFn = CUresult (*)(CUdevice*, int);
@@ -785,9 +627,13 @@ CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
     return cuCtxCreate_v2(pctx, flags, dev);
 }
 
-CUresult cuCtxDestroy_v2(CUcontext /*ctx*/) { return CUDA_SUCCESS; }
+CUresult cuCtxDestroy_v2(CUcontext /*ctx*/) {
+    // Context destruction is not fully supported in remote mode
+    return CUDA_SUCCESS;
+}
 CUresult cuCtxDestroy(CUcontext ctx) { return cuCtxDestroy_v2(ctx); }
 CUresult cuCtxGetCurrent(CUcontext* pctx) {
+    // Context current queries return a synthetic context - not actually tracked
     using CuCtxGetCurrentFn = CUresult (*)(CUcontext*);
     using CuInitFn = CUresult (*)(unsigned int);
     using CuDeviceGetFn = CUresult (*)(CUdevice*, int);
@@ -842,6 +688,8 @@ CUresult cuCtxGetCurrent(CUcontext* pctx) {
     return CUDA_SUCCESS;
 }
 CUresult cuCtxSetCurrent(CUcontext ctx) {
+    // Context set current is not fully supported in remote mode
+    // but we allow it for compatibility
     using CuCtxSetCurrentFn = CUresult (*)(CUcontext);
     void* real = vgpu::realCudaHandle();
     if (real != nullptr) {
@@ -870,28 +718,38 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
     return cuCtxCreate_v2(pctx, 0, dev);
 }
 CUresult cuDevicePrimaryCtxSetFlags(CUdevice /*dev*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Primary context flags setting is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 CUresult cuDevicePrimaryCtxGetState(CUdevice /*dev*/, unsigned int* flags, int* active) {
     if (flags) *flags = 0;
     if (active) *active = 1;
     return CUDA_SUCCESS;
 }
-CUresult cuDevicePrimaryCtxReset(CUdevice /*dev*/) { return CUDA_SUCCESS; }
-CUresult cuDevicePrimaryCtxRelease_v2(CUdevice /*dev*/) { return CUDA_SUCCESS; }
+CUresult cuDevicePrimaryCtxReset(CUdevice /*dev*/) {
+    // Primary context reset is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+CUresult cuDevicePrimaryCtxRelease_v2(CUdevice /*dev*/) {
+    // Primary context release is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
 CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
     return cuDevicePrimaryCtxRelease_v2(dev);
 }
 CUresult cuCtxGetFlags(unsigned int* flags) {
+    // Context flags queries return default value - not actually tracked
     if (flags) *flags = 0;
     return CUDA_SUCCESS;
 }
 CUresult cuCtxDetach(CUcontext ctx) { return cuCtxDestroy_v2(ctx); }
 CUresult cuCtxGetApiVersion(CUcontext /*ctx*/, unsigned int* version) {
+    // Context API version queries return default value - not actually tracked
     if (version) *version = 12080;
     return CUDA_SUCCESS;
 }
 CUresult cuCtxGetDevice(CUdevice* dev) {
+    // Context device queries return the current device - not actually tracked
     using CuCtxGetDeviceFn = CUresult (*)(CUdevice*);
     void* real = vgpu::realCudaHandle();
     if (real != nullptr) {
@@ -920,12 +778,18 @@ CUresult cuCtxGetLimit(size_t* pvalue, int /*limit*/) {
     if (pvalue) *pvalue = 0;
     return CUDA_SUCCESS;
 }
-CUresult cuCtxSetLimit(int /*limit*/, size_t /*value*/) { return CUDA_SUCCESS; }
+CUresult cuCtxSetLimit(int /*limit*/, size_t /*value*/) {
+    // Limit setting is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
 CUresult cuCtxGetCacheConfig(int* pconfig) {
     if (pconfig) *pconfig = 0;
     return CUDA_SUCCESS;
 }
-CUresult cuCtxSetCacheConfig(int /*config*/) { return CUDA_SUCCESS; }
+CUresult cuCtxSetCacheConfig(int /*config*/) {
+    // Cache config setting is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
 CUresult cuCtxGetSharedMemConfig(int* pconfig) {
     if (pconfig) *pconfig = 0;
     return CUDA_SUCCESS;
@@ -935,13 +799,23 @@ CUresult cuCtxGetStreamPriorityRange(int* leastPriority, int* greatestPriority) 
     if (greatestPriority) *greatestPriority = 0;
     return CUDA_SUCCESS;
 }
-CUresult cuCtxSetSharedMemConfig(int /*config*/) { return CUDA_SUCCESS; }
-CUresult cuCtxResetPersistingL2Cache() { return CUDA_SUCCESS; }
+CUresult cuCtxSetSharedMemConfig(int /*config*/) {
+    // Shared memory config setting is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+CUresult cuCtxResetPersistingL2Cache() {
+    // L2 cache reset is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
 CUresult cuCtxPopCurrent(CUcontext* pctx) {
+    // Context stack operations are not fully supported in remote mode
     if (pctx) *pctx = reinterpret_cast<CUcontext>(static_cast<uintptr_t>(0xC7AC0001));
     return CUDA_SUCCESS;
 }
-CUresult cuCtxPushCurrent(CUcontext /*ctx*/) { return CUDA_SUCCESS; }
+CUresult cuCtxPushCurrent(CUcontext /*ctx*/) {
+    // Context stack operations are not fully supported in remote mode
+    return CUDA_SUCCESS;
+}
 CUresult cuCtxSynchronize() {
     vgpu::RpcResult r = vgpu::drvCallDrv(vgpu::RpcDrvOp::kCuCtxSynchronize, nullptr, 0);
     return r.status == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
@@ -953,7 +827,7 @@ static CUresult doModuleLoad(CUmodule* pmod, const void* image) {
     if (!image || !pmod) return CUDA_ERROR_INVALID_VALUE;
 
     // Follow wrapper if needed
-    const void* raw = vgpu::resolveRawFatbin(image);
+    const void* raw = vgpu::resolveRawFatbinPtr(image);
     size_t raw_size = vgpu::fatbinImageSize(image);
     if (!raw || raw_size == 0) return CUDA_ERROR_INVALID_VALUE;
 
@@ -1018,24 +892,23 @@ CUresult cuModuleUnload(CUmodule hmod) {
 
 CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes,
                            CUmodule /*hmod*/, const char* /*name*/) {
-    if (dptr) *dptr = 0;
-    if (bytes) *bytes = 0;
-    return CUDA_SUCCESS;
+    // Global variable lookup is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuModuleGetTexRef(void** pTexRef, CUmodule /*hmod*/, const char* /*name*/) {
-    if (pTexRef) *pTexRef = nullptr;
-    return CUDA_SUCCESS;
+    // Texture reference lookup is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuModuleGetSurfRef(void** pSurfRef, CUmodule /*hmod*/, const char* /*name*/) {
-    if (pSurfRef) *pSurfRef = nullptr;
-    return CUDA_SUCCESS;
+    // Surface reference lookup is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuModuleGetLoadingMode(int* mode) {
-    if (mode) *mode = 0;
-    return CUDA_SUCCESS;
+    // Module loading mode query is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 // ── Function lookup ──────────────────────────────────────────────────────────
@@ -1250,12 +1123,13 @@ CUresult cuMemGetInfo(size_t* free_bytes, size_t* total_bytes) {
 }
 
 CUresult cuMemGetAddressRange(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr) {
-    if (pbase) *pbase = dptr;
-    if (psize) *psize = 0;
-    return CUDA_SUCCESS;
+    // Memory address range query is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int /*flags*/) {
+    // Note: Uses regular malloc instead of CUDA pinned memory
+    // This is a compatibility shim - real pinned memory not available in remote mode
     if (!pp) return CUDA_ERROR_INVALID_VALUE;
     *pp = std::malloc(bytesize);
     return *pp ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
@@ -1267,25 +1141,30 @@ CUresult cuMemFreeHost(void* p) {
 }
 
 CUresult cuMemHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned int /*flags*/) {
+    // Note: Returns host pointer as device pointer - not semantically correct
+    // but sufficient for frameworks that only check if pointer is non-null
     if (!pdptr) return CUDA_ERROR_INVALID_VALUE;
     *pdptr = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(p));
     return CUDA_SUCCESS;
 }
 
 CUresult cuMemHostGetFlags(unsigned int* pFlags, void* /*p*/) {
+    // Returns default flags - real flags not tracked
     if (pFlags) *pFlags = 0;
     return CUDA_SUCCESS;
 }
 
 CUresult cuMemHostRegister(void* /*p*/, size_t /*bytesize*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemHostUnregister(void* /*p*/) {
-    return CUDA_SUCCESS;
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuPointerGetAttribute(void* data, int /*attribute*/, CUdeviceptr /*ptr*/) {
+    // Note: Returns zeroed data for compatibility
+    // Real implementation would query pointer attributes from server
     if (data) {
         std::memset(data, 0, sizeof(std::uintptr_t));
     }
@@ -1296,6 +1175,8 @@ CUresult cuPointerGetAttributes(unsigned int numAttributes,
                                 int* /*attributes*/,
                                 void** data,
                                 CUdeviceptr /*ptr*/) {
+    // Note: Returns zeroed data for compatibility
+    // Real implementation would query pointer attributes from server
     if (data) {
         for (unsigned int i = 0; i < numAttributes; ++i) {
             if (data[i]) {
@@ -1416,61 +1297,57 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream_drv /*hStream*/) {
 }
 
 CUresult cuMemPoolTrimTo(void* /*pool*/, size_t /*minBytesToKeep*/) {
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolSetAttribute(void* /*pool*/, int /*attr*/, void* /*value*/) {
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolGetAttribute(void* /*pool*/, int /*attr*/, void* value) {
-    if (value) {
-        std::memset(value, 0, sizeof(std::uint64_t));
-    }
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolSetAccess(void* /*pool*/, const void* /*map*/, size_t /*count*/) {
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolGetAccess(unsigned long long* flags, void* /*pool*/, const void* /*location*/) {
-    if (flags) {
-        *flags = 0;
-    }
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolCreate(void** pool, const void* /*poolProps*/) {
-    if (pool) {
-        *pool = vgpu::makeFakeHandle();
-    }
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolDestroy(void* /*pool*/) {
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolExportToShareableHandle(void* /*shareableHandle*/, void* /*pool*/, int /*handleType*/, unsigned int /*flags*/) {
+    // Memory pool operations are not supported in remote mode
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolImportFromShareableHandle(void** pool, void* /*shareableHandle*/, int /*handleType*/, unsigned int /*flags*/) {
-    if (pool) {
-        *pool = vgpu::makeFakeHandle();
-    }
-    return CUDA_SUCCESS;
+    // Memory pool operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolExportPointer(void* /*exportData*/, CUdeviceptr /*ptr*/) {
+    // Memory pool operations are not supported in remote mode
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPoolImportPointer(CUdeviceptr* ptr, void* /*pool*/, void* /*exportData*/) {
-    if (ptr) {
-        *ptr = 0;
-    }
+    // Memory pool operations are not supported in remote mode
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 
@@ -1552,16 +1429,19 @@ CUresult cuStreamQuery(CUstream_drv hStream) {
 }
 
 CUresult cuStreamGetPriority(CUstream_drv /*hStream*/, int* priority) {
+    // Priority queries return default value - not actually tracked
     if (priority) *priority = 0;
     return CUDA_SUCCESS;
 }
 
 CUresult cuStreamGetFlags(CUstream_drv /*hStream*/, unsigned int* flags) {
+    // Flags queries return default value - not actually tracked
     if (flags) *flags = 0;
     return CUDA_SUCCESS;
 }
 
 CUresult cuStreamGetCtx(CUstream_drv /*hStream*/, CUcontext* pctx) {
+    // Stream context queries return a synthetic context - not actually tracked
     if (pctx) {
         *pctx = reinterpret_cast<CUcontext>(static_cast<uintptr_t>(0xC7AC0001));
     }
@@ -1569,6 +1449,7 @@ CUresult cuStreamGetCtx(CUstream_drv /*hStream*/, CUcontext* pctx) {
 }
 
 CUresult cuStreamGetDevice(CUstream_drv /*hStream*/, CUdevice* dev) {
+    // Stream device queries return the current device - not actually tracked
     if (dev) {
         *dev = static_cast<CUdevice>(vgpu::g_drv_device);
     }
@@ -1628,6 +1509,8 @@ CUresult cuEventQuery(void* hEvent) {
 }
 
 CUresult cuEventElapsedTime(float* pMilliseconds, void* /*hStart*/, void* /*hEnd*/) {
+    // Note: Elapsed time measurement is not supported in remote mode
+    // Returns 0.0f for compatibility, but this is not accurate
     if (pMilliseconds) {
         *pMilliseconds = 0.0f;
     }
@@ -1635,14 +1518,18 @@ CUresult cuEventElapsedTime(float* pMilliseconds, void* /*hStart*/, void* /*hEnd
 }
 
 CUresult cuEventRecordWithFlags(void* hEvent, CUstream_drv hStream, unsigned int /*flags*/) {
+    // Flags are ignored - forward to regular event record
     return cuEventRecord(hEvent, hStream);
 }
 
 CUresult cuThreadExchangeStreamCaptureMode(int* /*mode*/) {
+    // Stream capture is not supported, but we allow the mode exchange for compatibility
     return CUDA_SUCCESS;
 }
 
 CUresult cuLaunchHostFunc(CUstream_drv /*hStream*/, void (*fn)(void*), void* userData) {
+    // Note: This is a synchronous stub - real CUDA would call fn asynchronously
+    // when all prior work in the stream completes. We call it immediately for compatibility.
     if (fn) {
         fn(userData);
     }
@@ -1650,6 +1537,7 @@ CUresult cuLaunchHostFunc(CUstream_drv /*hStream*/, void (*fn)(void*), void* use
 }
 
 CUresult cuStreamGetId(CUstream_drv /*hStream*/, std::uint64_t* streamId) {
+    // Stream ID queries return 0 - not actually tracked
     if (streamId) {
         *streamId = 0;
     }
@@ -1660,6 +1548,8 @@ CUresult cuStreamAddCallback(CUstream_drv hStream,
                              void (*callback)(CUstream_drv, CUresult, void*),
                              void* userData,
                              unsigned int /*flags*/) {
+    // Note: This is a synchronous stub - real CUDA would call callback asynchronously
+    // when all prior work in the stream completes. We call it immediately for compatibility.
     if (callback) {
         callback(hStream, CUDA_SUCCESS, userData);
     }
@@ -1670,45 +1560,52 @@ CUresult cuStreamAttachMemAsync(CUstream_drv /*hStream*/,
                                 CUdeviceptr /*dptr*/,
                                 size_t /*length*/,
                                 unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Memory attachment is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamCopyAttributes(CUstream_drv /*dst*/, CUstream_drv /*src*/) {
-    return CUDA_SUCCESS;
+    // Stream attribute operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamGetAttribute(CUstream_drv /*hStream*/, int /*attr*/, void* value) {
-    if (value) {
-        std::memset(value, 0, 64);
-    }
-    return CUDA_SUCCESS;
+    // Stream attribute operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamSetAttribute(CUstream_drv /*hStream*/, int /*attr*/, const void* /*value*/) {
-    return CUDA_SUCCESS;
+    // Stream attribute operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamWaitValue32(CUstream_drv /*hStream*/, CUdeviceptr /*addr*/, unsigned int /*value*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Stream value operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamWriteValue32(CUstream_drv /*hStream*/, CUdeviceptr /*addr*/, unsigned int /*value*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Stream value operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamWaitValue64(CUstream_drv /*hStream*/, CUdeviceptr /*addr*/, std::uint64_t /*value*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Stream value operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamWriteValue64(CUstream_drv /*hStream*/, CUdeviceptr /*addr*/, std::uint64_t /*value*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Stream value operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuStreamBatchMemOp(CUstream_drv /*hStream*/, unsigned int /*count*/, void* /*paramArray*/, unsigned int /*flags*/) {
-    return CUDA_SUCCESS;
+    // Stream batch memory operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuDeviceCanAccessPeer(int* canAccessPeer, CUdevice /*dev*/, CUdevice /*peerDev*/) {
+    // Peer access queries return 0 (not accessible) - not actually tracked
     if (canAccessPeer) {
         *canAccessPeer = 0;
     }
@@ -1716,11 +1613,13 @@ CUresult cuDeviceCanAccessPeer(int* canAccessPeer, CUdevice /*dev*/, CUdevice /*
 }
 
 CUresult cuCtxEnablePeerAccess(CUcontext /*peerContext*/, unsigned int /*Flags*/) {
-    return CUDA_SUCCESS;
+    // Peer access is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuCtxDisablePeerAccess(CUcontext /*peerContext*/) {
-    return CUDA_SUCCESS;
+    // Peer access is not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuIpcGetEventHandle(void* /*pHandle*/, void* /*event*/) {
@@ -1753,22 +1652,26 @@ CUresult cuSignalExternalSemaphoresAsync(const void* /*extSemArray*/,
                                          const void* /*paramsArray*/,
                                          unsigned int /*numExtSems*/,
                                          CUstream_drv /*stream*/) {
-    return CUDA_SUCCESS;
+    // External semaphore operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuWaitExternalSemaphoresAsync(const void* /*extSemArray*/,
                                        const void* /*paramsArray*/,
                                        unsigned int /*numExtSems*/,
                                        CUstream_drv /*stream*/) {
-    return CUDA_SUCCESS;
+    // External semaphore operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemAdvise(CUdeviceptr /*devPtr*/, size_t /*count*/, int /*advice*/, CUdevice /*device*/) {
-    return CUDA_SUCCESS;
+    // Memory advisory operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemPrefetchAsync(CUdeviceptr /*devPtr*/, size_t /*count*/, CUdevice /*dstDevice*/, CUstream_drv /*hStream*/) {
-    return CUDA_SUCCESS;
+    // Memory prefetch operations are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemRangeGetAttribute(void* data,
@@ -1776,10 +1679,8 @@ CUresult cuMemRangeGetAttribute(void* data,
                                 int /*attribute*/,
                                 CUdeviceptr /*devPtr*/,
                                 size_t /*count*/) {
-    if (data && dataSize > 0) {
-        std::memset(data, 0, dataSize);
-    }
-    return CUDA_SUCCESS;
+    // Memory range attribute queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuMemRangeGetAttributes(void** data,
@@ -1788,42 +1689,30 @@ CUresult cuMemRangeGetAttributes(void** data,
                                  size_t numAttributes,
                                  CUdeviceptr /*devPtr*/,
                                  size_t /*count*/) {
-    if (data && dataSizes) {
-        for (size_t i = 0; i < numAttributes; ++i) {
-            if (data[i] && dataSizes[i] > 0) {
-                std::memset(data[i], 0, dataSizes[i]);
-            }
-        }
-    }
-    return CUDA_SUCCESS;
+    // Memory range attribute queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuOccupancyAvailableDynamicSMemPerBlock(size_t* dynamicSmemSize,
                                                  CUfunction /*func*/,
                                                  int /*numBlocks*/,
                                                  int /*blockSize*/) {
-    if (dynamicSmemSize) {
-        *dynamicSmemSize = 0;
-    }
-    return CUDA_SUCCESS;
+    // Occupancy queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuOccupancyMaxPotentialClusterSize(int* clusterSize,
                                             CUfunction /*func*/,
                                             const void* /*config*/) {
-    if (clusterSize) {
-        *clusterSize = 1;
-    }
-    return CUDA_SUCCESS;
+    // Occupancy queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuOccupancyMaxActiveClusters(int* numClusters,
                                       CUfunction /*func*/,
                                       const void* /*config*/) {
-    if (numClusters) {
-        *numClusters = 1;
-    }
-    return CUDA_SUCCESS;
+    // Occupancy queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
@@ -1832,10 +1721,8 @@ CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int /*blockSize*/,
     size_t /*dynamicSMemSize*/,
     unsigned int /*flags*/) {
-    if (numBlocks) {
-        *numBlocks = 1;
-    }
-    return CUDA_SUCCESS;
+    // Occupancy queries are not supported in remote mode
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult cuGetExportTable(const void** ppExportTable, const void* pExportTableId) {

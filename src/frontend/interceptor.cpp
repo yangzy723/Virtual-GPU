@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <fstream>
 
 #include "vgpu/common/context_registry.h"
 #include "vgpu/common/cuda_abi.h"
@@ -133,10 +132,7 @@ struct PendingLaunchConfig {
     bool valid;
 };
 
-struct FatbinImage {
-    const void* raw = nullptr;
-    std::size_t size = 0;
-};
+// FatbinImage is now defined in shim_utils.h
 
 RpcClient& client() {
     static RpcClient c;
@@ -163,133 +159,9 @@ cudaError_t remember(cudaError_t st) {
     return st;
 }
 
-FatbinImage resolveFatbinImage(const void* fat_cubin) {
-    static constexpr std::uint32_t kWrapMagic = 0x466243B1u;
-    static constexpr std::uint32_t kFatMagic = 0xBA55ED50u;
-
-    auto read32 = [](const void* ptr, std::size_t off, std::uint32_t* out) -> bool {
-        if (ptr == nullptr || out == nullptr) {
-            return false;
-        }
-        std::memcpy(out, static_cast<const std::uint8_t*>(ptr) + off, sizeof(*out));
-        return true;
-    };
-
-    auto read64 = [](const void* ptr, std::size_t off, std::uint64_t* out) -> bool {
-        if (ptr == nullptr || out == nullptr) {
-            return false;
-        }
-        std::memcpy(out, static_cast<const std::uint8_t*>(ptr) + off, sizeof(*out));
-        return true;
-    };
-
-    auto inferSize = [&](const void* raw) -> std::size_t {
-        if (raw == nullptr) {
-            return 0;
-        }
-
-        std::uint32_t magic = 0;
-        read32(raw, 0, &magic);
-        if (magic != kFatMagic) {
-            return 0;
-        }
-
-        // CUDA 12+ fatbin header variant:
-        //   u32 magic, u32 version, u64 data_size, u32 unknown, u32 header_size
-        // Total image bytes are header_size + data_size.
-        std::uint32_t version = 0;
-        std::uint64_t data64 = 0;
-        std::uint32_t header_v2 = 0;
-        read32(raw, 4, &version);
-        read64(raw, 8, &data64);
-        read32(raw, 20, &header_v2);
-
-        auto sane = [](std::size_t total, std::size_t header) -> bool {
-            static constexpr std::size_t kMinHeader = 16;
-            static constexpr std::size_t kMaxHeader = 1u << 20;   // 1 MiB
-            static constexpr std::size_t kMaxImage = 1ull << 33;  // 8 GiB safety cap
-            return header >= kMinHeader && header <= kMaxHeader && total >= header && total <= kMaxImage;
-        };
-
-        if (version == 0x00100001u) {
-            const std::size_t s_v2 = static_cast<std::size_t>(data64 + static_cast<std::uint64_t>(header_v2));
-            if (sane(s_v2, static_cast<std::size_t>(header_v2))) {
-                return s_v2;
-            }
-        }
-
-        // Legacy layout: u32 header_size @8, u32 data_size @12.
-        std::uint32_t h32 = 0;
-        std::uint32_t d32 = 0;
-        read32(raw, 8, &h32);
-        read32(raw, 12, &d32);
-        std::size_t s32 = static_cast<std::size_t>(h32) + static_cast<std::size_t>(d32);
-
-        if (sane(s32, static_cast<std::size_t>(h32))) {
-            return s32;
-        }
-
-        // Some toolchains store 64-bit header/data sizes.
-        std::uint64_t h64 = 0;
-        std::uint64_t d64 = 0;
-        read64(raw, 8, &h64);
-        read64(raw, 16, &d64);
-        std::size_t s64 = static_cast<std::size_t>(h64 + d64);
-        if (sane(s64, static_cast<std::size_t>(h64))) {
-            return s64;
-        }
-
-        return 0;
-    };
-
-    auto looksLikeFatRaw = [&](const void* ptr) -> bool {
-        if (ptr == nullptr) {
-            return false;
-        }
-        std::uint32_t magic = 0;
-        read32(ptr, 0, &magic);
-        return magic == kFatMagic;
-    };
-
-    if (fat_cubin == nullptr) {
-        return {};
-    }
-
-    const std::uint8_t* p = static_cast<const std::uint8_t*>(fat_cubin);
-    std::uint32_t magic = 0;
-    std::memcpy(&magic, p, sizeof(magic));
-
-    const void* raw = fat_cubin;
-    if (magic == kWrapMagic) {
-        // Wrapper layouts vary by toolchain/version. Probe common pointer slots.
-        const std::size_t candidate_offsets[] = {8, 16, 24, 32};
-        raw = nullptr;
-        for (std::size_t off : candidate_offsets) {
-            const void* data = nullptr;
-            std::memcpy(&data, p + off, sizeof(data));
-            if (looksLikeFatRaw(data)) {
-                raw = data;
-                break;
-            }
-        }
-        if (raw == nullptr) {
-            return {};
-        }
-        std::memcpy(&magic, raw, sizeof(magic));
-    }
-
-    if (magic != kFatMagic) {
-        return {};
-    }
-
-    FatbinImage out{};
-    out.raw = raw;
-    out.size = inferSize(raw);
-    if (out.size == 0) {
-        return {};
-    }
-    return out;
-}
+// resolveFatbinImage is now replaced by shared helpers in shim_utils.h:
+//   resolveRawFatbinPtr() - resolves wrapper to raw fatbin pointer
+//   fatbinImageSize() - computes total image size from header
 
 void registerKnownModuleAliases(void** fat_cubin_handle, const void* alias, std::uint64_t module_id) {
     if (module_id == 0) {
@@ -358,70 +230,7 @@ bool queryTotalGlobalMemFromServer(std::size_t* total_bytes) {
     return true;
 }
 
-std::vector<std::uint8_t> makePackedArgsFromTotalBytes(void** args, std::uint32_t total_param_bytes) {
-    std::vector<std::uint8_t> out;
-    if (args == nullptr || total_param_bytes == 0) {
-        return out;
-    }
-
-    out.assign(total_param_bytes, 0);
-
-    // Heuristic fallback when PTX-derived per-argument metadata is unavailable.
-    const std::size_t slot = sizeof(std::uint64_t);
-    std::size_t max_args = (static_cast<std::size_t>(total_param_bytes) + slot - 1) / slot;
-    if (max_args > 64) {
-        max_args = 64;
-    }
-
-    for (std::size_t i = 0; i < max_args; ++i) {
-        void* arg_ptr = args[i];
-        if (arg_ptr == nullptr && i > 0) {
-            break;
-        }
-        if (arg_ptr == nullptr) {
-            continue;
-        }
-
-        const std::size_t off = i * slot;
-        if (off >= out.size()) {
-            break;
-        }
-        const std::size_t n = std::min(slot, out.size() - off);
-        std::memcpy(out.data() + off, arg_ptr, n);
-    }
-
-    return out;
-}
-
-std::vector<std::uint8_t> makeArgumentSlotsUnknown(void** args, std::size_t max_slots = 12) {
-    std::vector<std::uint8_t> out;
-    if (args == nullptr || max_slots == 0) {
-        return out;
-    }
-
-    const std::size_t slot = sizeof(std::uint64_t);
-    out.assign(max_slots * slot, 0);
-
-    std::size_t used = 0;
-    for (std::size_t i = 0; i < max_slots; ++i) {
-        void* arg_ptr = args[i];
-        if (arg_ptr == nullptr && i > 0) {
-            break;
-        }
-        if (arg_ptr == nullptr) {
-            used = i + 1;
-            continue;
-        }
-        if (!processRangeHasAccess(reinterpret_cast<std::uintptr_t>(arg_ptr), slot, ProcMapAccess::Read)) {
-            break;
-        }
-        std::memcpy(out.data() + i * slot, arg_ptr, slot);
-        used = i + 1;
-    }
-
-    out.resize(used * slot);
-    return out;
-}
+// makePackedArgsFromTotalBytes and makeArgumentSlotsUnknown are now in shim_utils.h
 
 int queryAttrOrDefault(int attr, int device, int fallback) {
     int value = 0;
@@ -841,10 +650,11 @@ extern "C" cudaError_t cudaDeviceCanAccessPeer(int* canAccessPeer, int /*device*
 }
 
 extern "C" cudaError_t cudaDeviceEnablePeerAccess(int /*peerDevice*/, unsigned int /*flags*/) {
-    return vgpu::remember(cudaSuccess);
+    return vgpu::remember(vgpu::unsupported("cudaDeviceEnablePeerAccess"));
 }
 
 extern "C" cudaError_t cudaDeviceGetPCIBusId(char* pciBusId, int len, int /*device*/) {
+    // Returns a dummy PCI bus ID - real device info not available in remote mode
     if (pciBusId && len > 0) {
         std::strncpy(pciBusId, "0000:00:00.0", static_cast<std::size_t>(len - 1));
         pciBusId[len - 1] = '\0';
@@ -853,6 +663,7 @@ extern "C" cudaError_t cudaDeviceGetPCIBusId(char* pciBusId, int len, int /*devi
 }
 
 extern "C" cudaError_t cudaDeviceGetStreamPriorityRange(int* leastPriority, int* greatestPriority) {
+    // Priority range queries return default values - not actually tracked
     if (leastPriority) {
         *leastPriority = 0;
     }
@@ -863,6 +674,8 @@ extern "C" cudaError_t cudaDeviceGetStreamPriorityRange(int* leastPriority, int*
 }
 
 extern "C" cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t /*start*/, cudaEvent_t /*end*/) {
+    // Note: Elapsed time measurement is not supported in remote mode
+    // Returns 0.0f for compatibility, but this is not accurate
     if (ms) {
         *ms = 0.0f;
     }
@@ -874,6 +687,8 @@ extern "C" cudaError_t cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t 
 }
 
 extern "C" cudaError_t cudaHostAlloc(void** pHost, std::size_t size, unsigned int /*flags*/) {
+    // Note: Uses regular malloc instead of CUDA pinned memory
+    // This is a compatibility shim - real pinned memory not available in remote mode
     if (!pHost) {
         return vgpu::remember(cudaErrorUnknown);
     }
@@ -887,14 +702,17 @@ extern "C" cudaError_t cudaFreeHost(void* ptr) {
 }
 
 extern "C" cudaError_t cudaHostRegister(void* /*ptr*/, std::size_t /*size*/, unsigned int /*flags*/) {
-    return vgpu::remember(cudaSuccess);
+    return vgpu::remember(vgpu::unsupported("cudaHostRegister"));
 }
 
 extern "C" cudaError_t cudaHostUnregister(void* /*ptr*/) {
-    return vgpu::remember(cudaSuccess);
+    return vgpu::remember(vgpu::unsupported("cudaHostUnregister"));
 }
 
 extern "C" cudaError_t cudaFuncGetAttributes(void* attr, const void* /*func*/) {
+    // Note: Returns reasonable defaults for function attributes
+    // Real implementation would query from server, but many frameworks
+    // only use these for heuristics, not correctness
     if (attr) {
         struct FuncAttrPrefix {
             std::size_t sharedSizeBytes;
@@ -928,7 +746,7 @@ extern "C" cudaError_t cudaFuncGetAttributes(void* attr, const void* /*func*/) {
 }
 
 extern "C" cudaError_t cudaFuncSetAttribute(const void* /*func*/, int /*attr*/, int /*value*/) {
-    return vgpu::remember(cudaSuccess);
+    return vgpu::remember(vgpu::unsupported("cudaFuncSetAttribute"));
 }
 
 extern "C" cudaError_t cudaGetDeviceProperties_v2(void* prop, int device) {
@@ -1144,13 +962,12 @@ extern "C" cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int /*blockSize*/,
     std::size_t /*dynamicSMemSize*/,
     unsigned int /*flags*/) {
-    if (numBlocks) {
-        *numBlocks = 1;
-    }
-    return vgpu::remember(cudaSuccess);
+    return vgpu::remember(vgpu::unsupported("cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags"));
 }
 
 extern "C" cudaError_t cudaPointerGetAttributes(void* attributes, const void* /*ptr*/) {
+    // Note: Returns success with zeroed attributes for compatibility
+    // Real implementation would query the pointer type from server
     if (attributes) {
         std::memset(attributes, 0, 64);
     }
@@ -1162,6 +979,8 @@ extern "C" cudaError_t cudaStreamAddCallback(
     void (*callback)(cudaStream_t, cudaError_t, void*),
     void* userData,
     unsigned int /*flags*/) {
+    // Note: This is a synchronous stub - real CUDA would call callback asynchronously
+    // when all prior work in the stream completes. We call it immediately for compatibility.
     if (callback) {
         callback(nullptr, cudaSuccess, userData);
     }
@@ -1180,6 +999,7 @@ extern "C" cudaError_t cudaStreamCreateWithPriority(
 }
 
 extern "C" cudaError_t cudaStreamGetPriority(cudaStream_t /*stream*/, int* priority) {
+    // Priority queries return default value - not actually tracked
     if (priority) {
         *priority = 0;
     }
@@ -1228,7 +1048,8 @@ extern "C" cudaError_t cudaStreamIsCapturing(cudaStream_t /*stream*/, int* captu
 }
 
 extern "C" cudaError_t cudaThreadExchangeStreamCaptureMode(int* mode) {
-    // Keep caller-provided mode unchanged and report success for compatibility.
+    // Stream capture is not supported, but we allow the mode exchange for compatibility
+    // The caller's mode is kept unchanged
     (void)mode;
     return vgpu::remember(cudaSuccess);
 }
@@ -1271,11 +1092,13 @@ extern "C" cudaError_t cudaLaunchHostFunc(
 }
 
 extern "C" cudaError_t cudaProfilerStart(void) {
-    return vgpu::remember(cudaSuccess);
+    // Profiler control is not supported in remote mode
+    return vgpu::remember(vgpu::unsupported("cudaProfilerStart"));
 }
 
 extern "C" cudaError_t cudaProfilerStop(void) {
-    return vgpu::remember(cudaSuccess);
+    // Profiler control is not supported in remote mode
+    return vgpu::remember(vgpu::unsupported("cudaProfilerStop"));
 }
 
 extern "C" cudaError_t cudaDeviceGetDefaultMemPool(void** memPool, int /*device*/) {
@@ -1335,7 +1158,9 @@ extern "C" void** __cudaRegisterFatBinary(void* fatCubin) {
     // Allocate a persistent handle (freed when module is unregistered)
     void** handle = new void*(nullptr);
 
-    vgpu::FatbinImage img = vgpu::resolveFatbinImage(fatCubin);
+    vgpu::FatbinImage img{};
+    img.raw = vgpu::resolveRawFatbinPtr(fatCubin);
+    img.size = vgpu::fatbinImageSize(fatCubin);
 
     // Upload fatbin to server; get back a module_id
     if (img.raw != nullptr && img.size > 0) {
@@ -1415,7 +1240,9 @@ extern "C" void __cudaRegisterFunction(
                 continue;
             }
 
-            vgpu::FatbinImage img = vgpu::resolveFatbinImage(cand);
+            vgpu::FatbinImage img{};
+            img.raw = vgpu::resolveRawFatbinPtr(cand);
+            img.size = vgpu::fatbinImageSize(cand);
             if (img.raw == nullptr || img.size == 0) {
                 continue;
             }

@@ -7,10 +7,10 @@
 // which would bypass LD_PRELOAD and load the system's real CUDA library.
 
 #include <dlfcn.h>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 
-namespace vgpu {
 namespace {
 
 // Flag to prevent recursive dlopen during our own initialization
@@ -75,28 +75,30 @@ const char* findShimLibrary(const char* filename) {
 
 }  // namespace
 
-// Hooked dlopen function
+// Hooked dlopen function - must be extern "C" and outside any namespace
 extern "C" void* dlopen(const char* filename, int flags) {
     initOriginalFunctions();
 
     if (g_original_dlopen == nullptr) {
         return nullptr;
     }
-    
+
     // Prevent recursive calls
     HookGuard guard;
     if (guard.reentrant) {
         return g_original_dlopen(filename, flags);
     }
-    
+
     void* result = nullptr;
-    
+
     const char* shim_name = findShimLibrary(filename);
     if (shim_name != nullptr) {
 
         // Log the interception for debugging
-        std::fprintf(stderr, "[vGPU] dlopen interception: %s -> %s\n",
-                    filename, shim_name);
+        if (std::getenv("VGPU_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[vGPU] dlopen interception: %s -> %s\n",
+                        filename, shim_name);
+        }
 
         // Load our shim instead of the real library
         // Use RTLD_GLOBAL to make symbols globally visible
@@ -104,8 +106,10 @@ extern "C" void* dlopen(const char* filename, int flags) {
         result = g_original_dlopen(shim_name, flags | RTLD_GLOBAL);
 
         if (result == nullptr) {
-            std::fprintf(stderr, "[vGPU] Failed to load shim %s: %s\n",
-                        shim_name, dlerror());
+            if (std::getenv("VGPU_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[vGPU] Failed to load shim %s: %s\n",
+                            shim_name, dlerror());
+            }
             // Fall back to loading the original if our shim fails
             result = g_original_dlopen(filename, flags);
         }
@@ -117,14 +121,14 @@ extern "C" void* dlopen(const char* filename, int flags) {
     return result;
 }
 
-// Hooked dlsym function (usually not needed but provided for completeness)
+// Hooked dlsym function - must be extern "C" and outside any namespace
 extern "C" void* dlsym(void* handle, const char* symbol) {
     initOriginalFunctions();
 
     if (g_original_dlsym == nullptr) {
         return nullptr;
     }
-    
+
     // Prevent recursive calls
     HookGuard guard;
     if (guard.reentrant) {
@@ -134,5 +138,3 @@ extern "C" void* dlsym(void* handle, const char* symbol) {
     // Just forward to the original dlsym.
     return g_original_dlsym(handle, symbol);
 }
-
-}  // namespace vgpu
