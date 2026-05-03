@@ -5,13 +5,11 @@
 ## 架构
 
 ```
-进程 A ──拦截──▶ 询问 daemon ──批准──▶ 调用真实 GPU
-                          │
-                          └─拒绝──▶ 阻塞等待
-
-进程 B ──拦截──▶ 询问 daemon ──批准──▶ 调用真实 GPU
-                          │
-                          └─拒绝──▶ 阻塞等待
+进程 A ──拦截──┐
+               ├──▶ 同一个 daemon（统一审批）
+进程 B ──拦截──┘                 │
+                                ├─批准──▶ 客户端调用真实 GPU
+                                └─拒绝──▶ 客户端阻塞等待
 ```
 
 **核心洞察**：CUDA Runtime API (`libcudart`) 内部调用 Driver API (`libcuda`)。优先拦截 `libcuda.so` 即可覆盖绝大多数框架主路径（含 PyTorch 常见路径）。对 cuBLAS/cuDNN 等库，未拦截符号保持透传真实驱动。
@@ -24,7 +22,7 @@
 
 ## 版本
 
-- 当前版本：`0.3.1`（见 `VERSION`）
+- 当前版本：`0.3.2`（见 `VERSION`）
 - 变更记录：`CHANGELOG.md`
 
 ## 快速开始
@@ -107,7 +105,6 @@ LD_PRELOAD=build/libcuda.so python your_script.py
 | `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局最大并发 memcpy 数（0=不限制） |
 | `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询共享内存间隔（微秒） |
 | `GPU_SCHEDULER_VERBOSE` | 0 | 输出调度日志 |
-| `GPU_SCHEDULER_CONTROL_MEMCPY` | 0 | 客户端是否让 memcpy 路径走 daemon 调度 |
 | `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
 | `GPU_SCHEDULER_CONFIG` | 无 | 指定配置文件路径 |
 | `VGPU_TRACE` | 1 | shim trace 输出开关 |
@@ -134,7 +131,7 @@ vGPU/
 
 ## 工作原理
 
-1. Shim 库通过 `LD_PRELOAD` 导出 CUDA Driver API 符号
+1. Shim 库通过 `LD_PRELOAD` 优先接管 CUDA Driver API 符号，并覆写 `dlsym`/`cuGetProcAddress*` 以路由动态解析
 2. **重操作**（`cuMemAlloc*`、`cuLaunchKernel*`）：shim 写入共享内存，原子自旋等待 daemon 决策，然后调用真实 CUDA 函数
 3. **轻操作**（`cuDeviceGetAttribute`、`cuStreamCreate` 等）：shim 直接调用真实 CUDA 函数
 4. **Daemon** 通过轮询共享内存追踪每客户端的显存用量和活跃 kernel 数
@@ -146,11 +143,14 @@ vGPU/
 
 - `cuMemAlloc` / `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` / `cuMemFree` / `cuMemFreeAsync` — 显存分配/释放
 - `cuLaunchKernel` / `cuLaunchKernelEx` / `cuLaunchKernelExC` — kernel 启动
-- `cuMemcpyHtoD/DtoH/DtoD`（含 Async）— 当 `GPU_SCHEDULER_CONTROL_MEMCPY=1` 时走 daemon 调度
+- `cuMemcpyHtoD/DtoH/DtoD`（含 Async）— 主存/显存拷贝（始终走 daemon 调度）
 - `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作（当前仅透传，便于后续扩展）
 - `cuGetProcAddress` — 动态符号解析路由
+- `dlsym` — 动态符号查询入口（用于将 `cuGetProcAddress*` 查询导向 shim）
 
-其余符号（context、device、module、event、memcpy 等）直接透传到真实驱动。
+默认不 hook `dlopen`（兼容性优先）；当框架通过 `dlsym` + `cuGetProcAddress*` 解析 CUDA 符号时，仍可被当前路径覆盖。
+
+其余符号（context、device、module、event、memset 与未覆盖 Driver API）直接透传到真实驱动。
 
 ## 测试
 

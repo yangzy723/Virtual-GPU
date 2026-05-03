@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-05-03
+
+### Changed
+- Made memcpy scheduling always enabled for `cuMemcpyHtoD/DtoH/DtoD` (including Async paths); removed the optional control switch.
+
+### Fixed
+- Removed stale "optional memcpy" wording and aligned README/DESIGN with actual runtime behavior.
+
 ## [0.3.1] - 2026-05-03
 
 ### Fixed

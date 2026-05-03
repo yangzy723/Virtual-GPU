@@ -253,7 +253,6 @@ print("KERNEL_MEMCPY_DAEMON_TEST_PASSED", tuple(c.shape))
                 sock,
                 timeout=120,
                 extra_env={
-                    "GPU_SCHEDULER_CONTROL_MEMCPY": "1",
                     "VGPU_TRACE": "1",
                 },
             )

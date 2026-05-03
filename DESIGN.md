@@ -116,7 +116,7 @@ Daemon 追踪每客户端状态：
 - `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` — 异步显存分配
 - `cuMemFree` / `cuMemFree_v2` — 显存释放
 - `cuMemFreeAsync` — 异步显存释放
-- `cuMemcpyHtoD/DtoH/DtoD`（含 `_v2` 与 Async）— 可选 memcpy 调度
+- `cuMemcpyHtoD/DtoH/DtoD`（含 `_v2` 与 Async）— memcpy 调度
 - `cuLaunchKernel` — kernel 启动
 - `cuLaunchKernelEx` / `cuLaunchKernelExC` — 新版 kernel 启动接口
 - `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作
@@ -138,7 +138,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 | 显存分配 | `cuMemAlloc*` | shim 拦截 | 是 | 受显存配额限制 |
 | 显存释放 | `cuMemFree*` | shim 拦截 | 是（报告） | 释放后更新统计 |
 | Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | 当前完成语义为 launch-return |
-| Memcpy | `cuMemcpyHtoD/DtoH/DtoD`（含 Async） | shim 拦截 | 可选 | `GPU_SCHEDULER_CONTROL_MEMCPY=1` 启用；完成语义为 API-return |
+| Memcpy | `cuMemcpyHtoD/DtoH/DtoD`（含 Async） | shim 拦截 | 是 | 完成语义为 API-return |
 | Stream | `cuStream*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | Event | `cuEvent*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | 其余 Driver API | 如 `cuDevice*`、`cuModule*` | 转发真实驱动 | 否 | 维持兼容性优先 |
@@ -161,7 +161,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 2. 框架通过 `dlsym` 查询 `cuGetProcAddress` / `cuGetProcAddress_v2`。
 3. shim 拦截该查询，返回 shim 自身的 `cuGetProcAddress*`。
 4. 后续解析具体符号时：
-  - 若符号属于调度集合（如 `cuMemAlloc*`、`cuLaunchKernel*`、可选 `cuMemcpy*`），返回 shim 实现。
+  - 若符号属于调度集合（如 `cuMemAlloc*`、`cuLaunchKernel*`、`cuMemcpy*`），返回 shim 实现。
   - 否则转发给真实驱动的 `cuGetProcAddress*` 返回真实函数指针。
 5. 被 shim 接管的重操作走共享内存审批；轻操作保持透传。
 
@@ -194,7 +194,6 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 | `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询间隔（μs） |
 | `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
 | `GPU_SCHEDULER_VERBOSE` | 0 | 调度日志 |
-| `GPU_SCHEDULER_CONTROL_MEMCPY` | 0 | 客户端是否让 memcpy 路径走 daemon |
 
 ## 9. 已知局限
 
@@ -202,11 +201,9 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 
 Daemon 只能在 kernel 启动前阻塞客户端。Kernel 一旦开始执行，daemon 无法中断。
 
-### 9.2 Memcpy 管控为可选接口
+### 9.2 Memcpy 管控覆盖范围
 
-默认情况下，memcpy 仍可直接透传到真实驱动，以保持低开销。
-
-当客户端设置 `GPU_SCHEDULER_CONTROL_MEMCPY=1` 后，`cuMemcpyHtoD/DtoH/DtoD`（含 Async）会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝数。
+`cuMemcpyHtoD/DtoH/DtoD`（含 Async）会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝数。
 
 ### 9.3 单 GPU
 

@@ -114,12 +114,8 @@ std::mutex g_alloc_mu;
 std::unordered_map<uint64_t, size_t> g_alloc_sizes;
 
 bool memcpySchedulingEnabled() {
-    std::string v = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_CONTROL_MEMCPY");
-    if (v.empty()) {
-        v = vgpu::config::getEnvOrConfig("VGPU_CONTROL_MEMCPY");
-    }
-    if (v.empty()) return false;
-    return v == "1" || v == "true" || v == "TRUE";
+    // Memcpy scheduling is always enabled.
+    return true;
 }
 
 std::string daemonSocketPath() {
