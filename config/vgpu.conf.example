@@ -1,0 +1,14 @@
+# vGPU configuration file (key=value)
+# Environment variables with the same key override these values.
+
+GPU_SCHEDULER_SOCKET=/tmp/vgpu_control.sock
+GPU_SCHEDULER_MEM_LIMIT_MB=0
+GPU_SCHEDULER_CONTEXT_OVERHEAD_MB=800
+GPU_SCHEDULER_MAX_KERNELS=1
+GPU_SCHEDULER_MAX_MEMCPY=0
+GPU_SCHEDULER_POLL_US=100
+GPU_SCHEDULER_VERBOSE=0
+GPU_SCHEDULER_CONTROL_MEMCPY=0
+
+# Shim logging
+VGPU_TRACE=1

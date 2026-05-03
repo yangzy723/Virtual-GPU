@@ -26,12 +26,12 @@
 #include <unordered_set>
 
 #include "vgpu/cuda_abi.h"
+#include "vgpu/config.h"
 #include "vgpu/protocol.h"
 
 // Trace logging — controlled by VGPU_TRACE env var (default: on)
 static bool g_trace = [] {
-    const char* v = std::getenv("VGPU_TRACE");
-    return !v || v[0] != '0';
+    return vgpu::config::getBool("VGPU_TRACE", true);
 }();
 
 #define TRACE(fmt, ...) do { \
@@ -114,14 +114,16 @@ std::mutex g_alloc_mu;
 std::unordered_map<uint64_t, size_t> g_alloc_sizes;
 
 bool memcpySchedulingEnabled() {
-    const char* v = std::getenv("GPU_SCHEDULER_CONTROL_MEMCPY");
-    if (!v) v = std::getenv("VGPU_CONTROL_MEMCPY");
-    return v && v[0] == '1';
+    std::string v = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_CONTROL_MEMCPY");
+    if (v.empty()) {
+        v = vgpu::config::getEnvOrConfig("VGPU_CONTROL_MEMCPY");
+    }
+    if (v.empty()) return false;
+    return v == "1" || v == "true" || v == "TRUE";
 }
 
 std::string daemonSocketPath() {
-    const char* env = std::getenv("GPU_SCHEDULER_SOCKET");
-    return (env && env[0]) ? env : defaultSocketPath();
+    return vgpu::config::getEnvOrConfig("GPU_SCHEDULER_SOCKET", defaultSocketPath());
 }
 
 bool connectToDaemon() {
