@@ -8,7 +8,7 @@
 
 CUDA Runtime API (`libcudart`) 是 Driver API (`libcuda`) 的薄封装。PyTorch 调用 `cudaMalloc` 时，libcudart 内部调用 `cuMemAlloc`；调用 `cudaLaunchKernel` 时，内部调用 `cuLaunchKernel`。
 
-通过 `LD_PRELOAD` 拦截 `libcuda.so`，可以覆盖 CUDA Driver API 的主路径调用（包括 PyTorch、cuBLAS、cuDNN 常见路径）。这意味着：
+通过 `LD_PRELOAD` 拦截 `libcuda.so`，可以覆盖 CUDA Driver API 的主路径调用（PyTorch 等框架常见路径）。对 cuBLAS/cuDNN，关键在于未拦截符号可继续转发到真实驱动。这意味着：
 
 - **无需拦截 libcudart** — 避免 SONAME 冲突和转发桩
 - **通常无需 hook dlopen** — 真实 libcudart 正常加载
@@ -116,6 +116,7 @@ Daemon 追踪每客户端状态：
 - `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` — 异步显存分配
 - `cuMemFree` / `cuMemFree_v2` — 显存释放
 - `cuMemFreeAsync` — 异步显存释放
+- `cuMemcpyHtoD/DtoH/DtoD`（含 `_v2` 与 Async）— 可选 memcpy 调度
 - `cuLaunchKernel` — kernel 启动
 - `cuLaunchKernelEx` / `cuLaunchKernelExC` — 新版 kernel 启动接口
 - `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作
@@ -126,7 +127,7 @@ Daemon 追踪每客户端状态：
 - Device 操作（`cuDeviceGet`、`cuDeviceGetAttribute` 等）
 - Module 操作（`cuModuleLoad`、`cuModuleGetFunction` 等）
 - Event 操作（`cuEventCreate`、`cuEventRecord` 等）
-- Memcpy/Memset 操作
+- Memset 及其他未纳入调度集合的 Driver API
 
 LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态解析走正确路径。
 
@@ -137,10 +138,34 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 | 显存分配 | `cuMemAlloc*` | shim 拦截 | 是 | 受显存配额限制 |
 | 显存释放 | `cuMemFree*` | shim 拦截 | 是（报告） | 释放后更新统计 |
 | Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | 当前完成语义为 launch-return |
-| Memcpy | `cuMemcpy*` | shim 拦截 | 可选 | `GPU_SCHEDULER_CONTROL_MEMCPY=1` 启用 |
+| Memcpy | `cuMemcpyHtoD/DtoH/DtoD`（含 Async） | shim 拦截 | 可选 | `GPU_SCHEDULER_CONTROL_MEMCPY=1` 启用；完成语义为 API-return |
 | Stream | `cuStream*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | Event | `cuEvent*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | 其余 Driver API | 如 `cuDevice*`、`cuModule*` | 转发真实驱动 | 否 | 维持兼容性优先 |
+
+### 5.2 为什么默认不 hook dlopen
+
+本项目默认不 hook `dlopen`，核心考虑是“兼容性优先 + 必要最小拦截”：
+
+1. `dlopen` 是进程级全局动态加载入口，hook 后容易影响非 CUDA 依赖库的加载语义。
+2. 对 `dlopen` 的拦截通常需要处理句柄一致性、引用计数、递归调用和符号可见性，复杂度与回归风险都较高。
+3. 当前主路径已可通过 `dlsym` 与 `cuGetProcAddress` 覆盖 CUDA Driver API 的常见解析流程，通常无需再扩大拦截面。
+
+因此本设计将 `dlopen` hook 视为可选兜底策略，而不是默认路径。
+
+### 5.3 当前拦截路径
+
+当前实现采用“符号解析入口拦截 + 目标符号拦截”的两层方式：
+
+1. 框架加载 `libcuda.so.1`（通常由 `dlopen` 完成）。
+2. 框架通过 `dlsym` 查询 `cuGetProcAddress` / `cuGetProcAddress_v2`。
+3. shim 拦截该查询，返回 shim 自身的 `cuGetProcAddress*`。
+4. 后续解析具体符号时：
+  - 若符号属于调度集合（如 `cuMemAlloc*`、`cuLaunchKernel*`、可选 `cuMemcpy*`），返回 shim 实现。
+  - 否则转发给真实驱动的 `cuGetProcAddress*` 返回真实函数指针。
+5. 被 shim 接管的重操作走共享内存审批；轻操作保持透传。
+
+这条路径实现了“只拦截必要符号、其余保持驱动原语义”的设计目标。
 
 ## 6. cuGetExportTable
 
@@ -155,7 +180,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 - `schedRequest()` 返回 true（批准）
 - 所有操作直接在真实驱动上执行
 
-系统在有/无 daemon 时行为完全一致——daemon 只在存在时增加调度。
+系统在有/无 daemon 时核心功能保持可用——daemon 存在时增加审批逻辑，不可达时 fail-open 透传真实驱动。
 
 ## 8. 配置
 
@@ -167,6 +192,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 | `GPU_SCHEDULER_MAX_KERNELS` | 1 | 全局并发 kernel 上限 |
 | `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局并发 memcpy 上限（0=不限制） |
 | `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询间隔（μs） |
+| `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
 | `GPU_SCHEDULER_VERBOSE` | 0 | 调度日志 |
 | `GPU_SCHEDULER_CONTROL_MEMCPY` | 0 | 客户端是否让 memcpy 路径走 daemon |
 

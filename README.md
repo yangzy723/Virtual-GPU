@@ -14,13 +14,18 @@
                           └─拒绝──▶ 阻塞等待
 ```
 
-**核心洞察**：CUDA Runtime API (`libcudart`) 内部调用 Driver API (`libcuda`)。只需拦截 `libcuda.so`，即可捕获所有 CUDA 操作（包括 PyTorch、cuBLAS、cuDNN），无需拦截 `libcudart`。
+**核心洞察**：CUDA Runtime API (`libcudart`) 内部调用 Driver API (`libcuda`)。优先拦截 `libcuda.so` 即可覆盖绝大多数框架主路径（含 PyTorch 常见路径）。对 cuBLAS/cuDNN 等库，未拦截符号保持透传真实驱动。
 
 **调度模型**：daemon 只做审批决策，不执行任何 GPU 操作。所有 GPU 计算在本地真实驱动上执行。
 
 **通信机制**：UDS 握手建立连接，之后请求走共享内存原子状态机。
 
-**优雅降级**：daemon 未运行时，所有操作直接透传到真实驱动，行为完全一致。
+**优雅降级**：daemon 未运行时，重操作会 fail-open 到真实驱动，保证可用性优先（仍保留 shim 自身的轻微拦截开销）。
+
+## 版本
+
+- 当前版本：`0.3.1`（见 `VERSION`）
+- 变更记录：`CHANGELOG.md`
 
 ## 快速开始
 
@@ -103,6 +108,7 @@ LD_PRELOAD=build/libcuda.so python your_script.py
 | `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询共享内存间隔（微秒） |
 | `GPU_SCHEDULER_VERBOSE` | 0 | 输出调度日志 |
 | `GPU_SCHEDULER_CONTROL_MEMCPY` | 0 | 客户端是否让 memcpy 路径走 daemon 调度 |
+| `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
 | `GPU_SCHEDULER_CONFIG` | 无 | 指定配置文件路径 |
 | `VGPU_TRACE` | 1 | shim trace 输出开关 |
 
@@ -141,7 +147,7 @@ vGPU/
 - `cuMemAlloc` / `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` / `cuMemFree` / `cuMemFreeAsync` — 显存分配/释放
 - `cuLaunchKernel` / `cuLaunchKernelEx` / `cuLaunchKernelExC` — kernel 启动
 - `cuMemcpyHtoD/DtoH/DtoD`（含 Async）— 当 `GPU_SCHEDULER_CONTROL_MEMCPY=1` 时走 daemon 调度
-- `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作（用于 kernel 依赖追踪）
+- `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作（当前仅透传，便于后续扩展）
 - `cuGetProcAddress` — 动态符号解析路由
 
 其余符号（context、device、module、event、memcpy 等）直接透传到真实驱动。
@@ -163,5 +169,6 @@ python -m pytest tests/test_vgpu.py -v
 ## 已知局限
 
 - **无抢占式调度**：daemon 只能在 kernel 启动前阻塞客户端，无法中断正在执行的 kernel
-- **Memcpy 未管控**：内存拷贝操作直接透传，大块传输可能造成竞争
+- **Memcpy 管控粒度有限**：当前只覆盖 `cuMemcpyHtoD/DtoH/DtoD`（含 Async），2D/3D/Peer/Batch 系列仍未纳入管控
+- **完成语义偏保守**：`KERNEL_COMPLETE` / `MEMCPY_COMPLETE` 目前按 API 返回时上报，非设备端真实完成时刻
 - **单 GPU**：不支持多 GPU 调度或隔离

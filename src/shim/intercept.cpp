@@ -222,7 +222,36 @@ bool ensureConnected() {
 
 thread_local int g_current_device = 0;
 
-static bool waitForIdle(int max_iters = 200000) {
+static int waitIterations() {
+    static const int kDefaultIters = 200000;
+    static const int kIters = [] {
+        std::string raw = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_WAIT_ITERS");
+        if (raw.empty()) return kDefaultIters;
+
+        char* end = nullptr;
+        long parsed = std::strtol(raw.c_str(), &end, 10);
+        if (end == raw.c_str() || parsed <= 0) return kDefaultIters;
+        if (parsed > 5000000) return 5000000;
+        return static_cast<int>(parsed);
+    }();
+    return kIters;
+}
+
+static SchedState waitForDecision(int max_iters) {
+    if (!g_channel) return SchedState::REJECTED;
+    for (int i = 0; i < max_iters; i++) {
+        auto state = static_cast<SchedState>(
+            g_channel->state.load(std::memory_order_acquire));
+        if (state == SchedState::APPROVED || state == SchedState::REJECTED) {
+            return state;
+        }
+        if (i < 1000) SPIN_PAUSE();
+        else std::this_thread::yield();
+    }
+    return SchedState::PENDING;
+}
+
+static bool waitForIdle(int max_iters) {
     if (!g_channel) return false;
     for (int i = 0; i < max_iters; i++) {
         auto state = static_cast<SchedState>(
@@ -237,7 +266,7 @@ static bool waitForIdle(int max_iters = 200000) {
 bool schedRequest(SchedOp op, uint64_t value, int device) {
     if (!ensureConnected()) return true;
     std::lock_guard<std::mutex> lock(g_sched_mu);
-    if (!waitForIdle()) return true;
+    if (!waitForIdle(waitIterations())) return true;
 
     TRACE("daemon request op=%u value=%llu device=%d",
           static_cast<unsigned int>(op),
@@ -250,24 +279,20 @@ bool schedRequest(SchedOp op, uint64_t value, int device) {
     g_channel->state.store(static_cast<uint32_t>(SchedState::PENDING),
                            std::memory_order_release);
 
-    for (int i = 0; i < 200000; i++) {
-        auto state = static_cast<SchedState>(
-            g_channel->state.load(std::memory_order_acquire));
-        if (state == SchedState::APPROVED) {
-            g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
-                                   std::memory_order_release);
-            TRACE("daemon approved op=%u", static_cast<unsigned int>(op));
-            return true;
-        }
-        if (state == SchedState::REJECTED) {
-            g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
-                                   std::memory_order_release);
-            TRACE("daemon rejected op=%u", static_cast<unsigned int>(op));
-            return false;
-        }
-        if (i < 1000) SPIN_PAUSE();
-        else std::this_thread::yield();
+    auto decision = waitForDecision(waitIterations());
+    if (decision == SchedState::APPROVED) {
+        g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
+                               std::memory_order_release);
+        TRACE("daemon approved op=%u", static_cast<unsigned int>(op));
+        return true;
     }
+    if (decision == SchedState::REJECTED) {
+        g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
+                               std::memory_order_release);
+        TRACE("daemon rejected op=%u", static_cast<unsigned int>(op));
+        return false;
+    }
+
     TRACE("daemon request timeout, bypass op=%u", static_cast<unsigned int>(op));
     return true;
 }
@@ -275,7 +300,7 @@ bool schedRequest(SchedOp op, uint64_t value, int device) {
 void schedReport(SchedOp op, uint64_t value, int device) {
     if (!ensureConnected()) return;
     std::lock_guard<std::mutex> lock(g_sched_mu);
-    if (!waitForIdle()) return;
+    if (!waitForIdle(waitIterations())) return;
 
     TRACE("daemon report op=%u value=%llu device=%d",
           static_cast<unsigned int>(op),
@@ -288,16 +313,11 @@ void schedReport(SchedOp op, uint64_t value, int device) {
     g_channel->state.store(static_cast<uint32_t>(SchedState::PENDING),
                            std::memory_order_release);
 
-    for (int i = 0; i < 200000; i++) {
-        auto state = static_cast<SchedState>(
-            g_channel->state.load(std::memory_order_acquire));
-        if (state == SchedState::IDLE) {
-            TRACE("daemon report done op=%u", static_cast<unsigned int>(op));
-            return;
-        }
-        if (i < 1000) SPIN_PAUSE();
-        else std::this_thread::yield();
+    if (waitForIdle(waitIterations())) {
+        TRACE("daemon report done op=%u", static_cast<unsigned int>(op));
+        return;
     }
+
     TRACE("daemon report timeout op=%u", static_cast<unsigned int>(op));
 }
 
@@ -332,6 +352,9 @@ bool isInterceptedSymbol(const char* symbol) {
         "cuMemAllocAsync"sv, "cuMemAllocFromPoolAsync"sv,
         "cuMemFree"sv, "cuMemFree_v2"sv,
         "cuMemFreeAsync"sv,
+        "cuMemcpyHtoD"sv, "cuMemcpyHtoD_v2"sv,
+        "cuMemcpyDtoH"sv, "cuMemcpyDtoH_v2"sv,
+        "cuMemcpyDtoD"sv, "cuMemcpyDtoD_v2"sv,
         "cuMemcpyHtoDAsync"sv, "cuMemcpyDtoHAsync"sv, "cuMemcpyDtoDAsync"sv,
         "cuLaunchKernel"sv,
         "cuLaunchKernelEx"sv, "cuLaunchKernelExC"sv,
