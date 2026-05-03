@@ -1,253 +1,261 @@
-# Virtual-GPU Design
+# 设计文档
 
-## 1. Goal
+## 1. 目标
 
-Virtual-GPU transparently forwards CUDA Runtime and Driver API calls from a client process to a server process on the same machine that holds the real GPU.
+让多个进程共享一块 GPU。Daemon 作为门卫（gatekeeper），追踪资源使用并决定每个进程何时可以执行。所有 GPU 操作在本地真实驱动上执行。
 
-Design priorities:
+## 2. 核心洞察
 
-1. Support the high-frequency core path: memory allocation, memcpy, kernel launch.
-2. Maintain both Runtime and Driver API entry points.
-3. Keep code structure clear for incremental improvement.
+CUDA Runtime API (`libcudart`) 是 Driver API (`libcuda`) 的薄封装。PyTorch 调用 `cudaMalloc` 时，libcudart 内部调用 `cuMemAlloc`；调用 `cudaLaunchKernel` 时，内部调用 `cuLaunchKernel`。
 
-## 2. Non-Goals
+通过 `LD_PRELOAD` 拦截 `libcuda.so`，可以覆盖 CUDA Driver API 的主路径调用（包括 PyTorch、cuBLAS、cuDNN 常见路径）。这意味着：
 
-- Full CUDA compatibility layer
-- Distributed multi-machine GPU scheduling
-- cuBLAS / cuDNN / NCCL proxy layers
-- Complete CUDA Graph / IPC / Peer Access / VMM semantics
+- **无需拦截 libcudart** — 避免 SONAME 冲突和转发桩
+- **通常无需 hook dlopen** — 真实 libcudart 正常加载
+- **覆盖边界清晰** — 以 `cuGetProcAddress` 和显式导出符号为主，少数非常规解析路径可能需要额外 hook 策略
 
-## 3. System Overview
+## 3. 系统架构
 
-```mermaid
-flowchart LR
-    subgraph Client[Client Process]
-        APP[CUDA App / PyTorch]
-        PRELOAD[libvgpu_preload_init.so]
-        RT[libcudart.so.12 shim]
-        DRV[libcuda.so shim]
-        APP --> PRELOAD
-        APP --> RT
-        APP --> DRV
-    end
-
-    subgraph Shared[Shared Components]
-        PROTO[protocol.h]
-        RPC[rpc_client.cpp]
-        FATBIN[fatbin_parser.cpp]
-        KREG[kernel_registry.cpp]
-        CREG[context_registry.cpp]
-    end
-
-    subgraph Server[Server Process]
-        SERVER[vgpu_server]
-        DISPATCH[server_main.cpp]
-        RTL[cuda_runtime_loader.cpp]
-        DRVL[cuda_driver_loader.cpp]
-        REAL[Real CUDA libs]
-        GPU[NVIDIA GPU]
-        SERVER --> DISPATCH
-        DISPATCH --> RTL
-        DISPATCH --> DRVL
-        RTL --> REAL
-        DRVL --> REAL
-        REAL --> GPU
-    end
-
-    RT --> RPC
-    DRV --> RPC
-    RPC --> SERVER
+```
+┌─────────────┐    ┌─────────────┐
+│   进程 A     │    │   进程 B     │
+│  (PyTorch)  │    │  (cuBLAS)   │
+└──────┬──────┘    └──────┬──────┘
+       │                  │
+       ▼                  ▼
+┌──────────────────────────────────┐
+│  LD_PRELOAD: libcuda.so (shim)   │
+│                                  │
+│  重操作 → 共享内存 → daemon 审批  │
+│  轻操作 → 直接调用真实驱动        │
+└──────────┬───────────────────────┘
+           │
+           ▼
+┌──────────────────────┐     ┌──────────────────┐
+│  gpu_scheduler       │     │  真实 libcuda.so.1│
+│  (daemon, 不碰 GPU)  │     │  (NVIDIA 驱动)    │
+│                      │     │                   │
+│  轮询共享内存         │     │  执行 GPU 操作     │
+│  做审批决策           │     │                   │
+└──────────────────────┘     └──────────────────┘
 ```
 
-## 4. Layers and Responsibilities
+## 4. 调度模型
 
-### 4.1 Frontend
+### 4.1 门卫模式
 
-Runs in the client process. Exports shim symbols, collects parameters, constructs RPC requests, handles responses.
+Daemon 从不执行 GPU 操作，只做调度决策：
 
-**Key files:**
+1. **客户端请求** — shim 写入共享内存，设置 state 为 PENDING
+2. **Daemon 决策** — 轮询共享内存，设置 state 为 APPROVED 或 REJECTED
+3. **客户端执行** — shim 读取响应，调用真实 CUDA 函数
+4. **完成报告** — shim 发送 FREE 或 KERNEL_COMPLETE，daemon 重置 state 为 IDLE
 
-- `src/frontend/interceptor.cpp` — Runtime API entry point. Handles `cudaMalloc`, `cudaMemcpy`, `cudaLaunchKernel`, `__cudaRegisterFatBinary`, `__cudaRegisterFunction`.
-- `src/frontend/driver_interceptor.cpp` — Driver API entry point. Handles `cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`, device/context/stream/event interfaces.
-- `src/common/dlopen_hook.cpp` — Interposes `dlopen` / `dlsym` to redirect framework library loading to shim libraries.
-- `src/common/cuda_preload_init.cpp` — Preload initialization timing.
+### 4.2 通信：共享内存
 
-**Compatibility strategy:** Frontend functions fall into three categories:
+每个客户端有专属的共享内存通道（daemon 在握手时创建）。
 
-1. **Full forwarding** — Parameters encoded and sent to server (e.g., `cudaMalloc`, `cudaLaunchKernel`).
-2. **Compatibility stubs** — Return success with reasonable defaults for framework probing (e.g., `cudaGetDeviceProperties` returns a plausible device profile).
-3. **Explicit not-supported** — Return `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` for capabilities that are genuinely absent (IPC, Graph, MemPool, UVM, etc.).
+```
+ShmChannel (128 字节, cache-line 对齐):
+  atomic<uint32_t> state      — IDLE/PENDING/APPROVED/REJECTED
+  atomic<uint32_t> op         — ALLOC_REQUEST/FREE/KERNEL_REQUEST/KERNEL_COMPLETE
+  atomic<uint64_t> value      — ALLOC 字节数
+  atomic<int32_t>  result     — 0=成功, 负数=错误
+  atomic<uint32_t> device     — GPU 设备号
+  atomic<uint64_t> client_id  — 客户端 PID
+  atomic<uint32_t> dying      — 客户端断开标记
+```
 
-The boundary between categories 2 and 3 is: if returning success would cause the framework to proceed with a code path that silently produces wrong results, return not-supported instead.
+**快路径**：shim 写请求 → 设置 PENDING → 自旋等待 → 读响应。延迟：微秒级。
 
-### 4.2 Common
+**慢路径**：daemon 每 100μs 轮询所有通道。通过 epoll 检测 UDS 连接断开。
 
-Shared protocol and metadata layer between frontend and backend.
+轮询间隔可通过 `GPU_SCHEDULER_POLL_US` 调整（默认 100μs）。
 
-**Key files:**
+### 4.3 握手协议
 
-- `include/vgpu/common/protocol.h` — Defines `RpcOp`, `RpcDrvOp`, request/response headers, payload structures.
-- `src/common/rpc_client.cpp` — Unix Domain Socket RPC client with connection management and timeout handling.
-- `src/common/fatbin_parser.cpp` — Extracts kernel parameter layout from fatbin / PTX images.
-- `src/common/kernel_registry.cpp` — Maps fake handles to server-side module/function IDs; caches parameter layouts.
-- `src/common/context_registry.cpp` — Allocates stable context IDs per device.
-- `include/vgpu/frontend/shim_utils.h` — Shared frontend helpers: fatbin image parsing, argument packing, `/proc/self/maps` access checks, environment variable utilities.
+1. Shim 通过 UDS 连接 daemon（`/tmp/vgpu_control.sock`）
+2. 发送 HELLO + PID
+3. Daemon 创建共享内存（`/dev/shm/vgpu_PID`），注册客户端
+4. Daemon 返回共享内存名称
+5. Shim mmap 共享内存
+6. 后续所有通信走共享内存（不再有 UDS 请求）
 
-### 4.3 Backend
+### 4.4 死亡检测
 
-Runs in the server process. Receives RPC requests, dispatches to real CUDA libraries.
+- Daemon 保持每个客户端的 UDS 连接
+- 通过 epoll 检测 EPOLLHUP（客户端进程死亡）
+- 检测到死亡后：注销客户端、取消链接共享内存、释放配额
+- GPU 显存由 OS 自动回收
 
-**Key files:**
+### 4.5 延迟释放（Deferred Unmap）
 
-- `src/backend/server_main.cpp` — Server entry point. Socket accept, per-connection request handling, Runtime/Driver dispatch.
-- `src/backend/cuda_runtime_loader.cpp` — Dynamically loads real `libcudart.so`, resolves symbols.
-- `src/backend/cuda_driver_loader.cpp` — Dynamically loads real `libcuda.so`, resolves symbols.
+多线程环境下，poll 线程和 epoll 线程可能同时访问同一通道。解决方案：
 
-## 5. Key Execution Paths
+1. Epoll 线程检测到客户端死亡 → 设置 `dying` 标记 → 将通道指针置空
+2. Poll 线程看到 `dying` 标记 → 停止使用该通道
+3. Epoll 线程在释放锁后执行 munmap
 
-### 5.1 Memory Operations
+这避免了 use-after-free，无需在持锁期间执行系统调用。
 
-Using `cudaMemcpy` (H2D) as an example:
+### 4.6 资源追踪
 
-1. Application calls `cudaMemcpy(dst, src, count, cudaMemcpyHostToDevice)`.
-2. Frontend encodes parameters as `RpcMemcpyReq`.
-3. Host source data sent as extra payload.
-4. Server decodes and calls real `cudaMemcpy`.
-5. Server returns status.
-6. For D2H direction, server sends result data back as payload; frontend copies to caller's buffer.
+Daemon 追踪每客户端状态：
 
-### 5.2 Runtime Kernel Launch
+- **显存用量** — 注册时预扣 800MB context 开销
+- **活跃 kernel 数** — KERNEL_REQUEST 时加一，KERNEL_COMPLETE 时减一
 
-The most critical Runtime path:
+显存配额强制执行：如果客户端超限，daemon 拒绝请求，shim 返回 `CUDA_ERROR_OUT_OF_MEMORY`。
 
-1. NVCC triggers `__cudaRegisterFatBinary` at program startup or module load.
-2. Frontend uploads fatbin to server, receives `module_id`.
-3. Frontend uses `fatbin_parser` to extract parameter layout, caches in `kernel_registry`.
-4. `__cudaRegisterFunction` exchanges function name for `func_id` with server.
-5. At `cudaLaunchKernel` time, frontend packs `void** args` into contiguous buffer using cached `ParamInfo`.
-6. Request sent as `RpcCuLaunchKernelReq` + argument buffer.
-7. Server calls real `cuLaunchKernel`.
+## 5. 符号拦截策略
 
-Parameter metadata is resolved at registration time to minimize overhead at launch time.
+`cuGetProcAddress` 是动态符号解析的入口。拦截策略：
 
-### 5.3 Driver Direct Path
+**需要调度逻辑的符号**（从 shim 返回）：
+- `cuMemAlloc` / `cuMemAlloc_v2` — 显存分配
+- `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` — 异步显存分配
+- `cuMemFree` / `cuMemFree_v2` — 显存释放
+- `cuMemFreeAsync` — 异步显存释放
+- `cuLaunchKernel` — kernel 启动
+- `cuLaunchKernelEx` / `cuLaunchKernelExC` — 新版 kernel 启动接口
+- `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作
+- `cuGetProcAddress` / `cuGetProcAddress_v2` — 自身
 
-Using `cuModuleLoadData` -> `cuModuleGetFunction` -> `cuLaunchKernel`:
+**其余符号**（默认从真实驱动返回）：
+- Context 操作（`cuCtxCreate`、`cuCtxSetCurrent` 等）
+- Device 操作（`cuDeviceGet`、`cuDeviceGetAttribute` 等）
+- Module 操作（`cuModuleLoad`、`cuModuleGetFunction` 等）
+- Event 操作（`cuEventCreate`、`cuEventRecord` 等）
+- Memcpy/Memset 操作
 
-1. Driver shim forwards fatbin to server as-is.
-2. Server loads module, returns `module_id`.
-3. Frontend creates a fake `CUmodule` handle, records fake-to-server mapping in `kernel_registry`.
-4. `cuModuleGetFunction` exchanges for `func_id`, creates fake `CUfunction` handle.
-5. `cuLaunchKernel` looks up `func_id` and parameter layout from local registry, forwards to server.
+LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态解析走正确路径。
 
-Core principle: client exposes only fake handles; server holds real `CUmodule` / `CUfunction`; registry bridges the two.
+### 5.1 接口覆盖矩阵
 
-## 6. Handle and Context Model
+| 接口类别 | 代表 API | 处理方式 | 是否走 daemon | 备注 |
+|---|---|---|---|---|
+| 显存分配 | `cuMemAlloc*` | shim 拦截 | 是 | 受显存配额限制 |
+| 显存释放 | `cuMemFree*` | shim 拦截 | 是（报告） | 释放后更新统计 |
+| Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | 当前完成语义为 launch-return |
+| Memcpy | `cuMemcpy*` | shim 拦截 | 可选 | `GPU_SCHEDULER_CONTROL_MEMCPY=1` 启用 |
+| Stream | `cuStream*` | shim 拦截 | 否 | 直接透传真实驱动 |
+| Event | `cuEvent*` | shim 拦截 | 否 | 直接透传真实驱动 |
+| 其余 Driver API | 如 `cuDevice*`、`cuModule*` | 转发真实驱动 | 否 | 维持兼容性优先 |
 
-### 6.1 Fake Handles
+## 6. cuGetExportTable
 
-Many client-side handles are shim-generated fakes:
+默认转发到真实驱动。cuBLAS/cuDNN 需要真实的 export table 才能正常工作。
 
-- Prevents server-side real pointers from leaking to client.
-- Maintains unified local handle model across Runtime and Driver entries.
-- Enables registry lookup for `module_id` / `func_id` / parameter info in subsequent calls.
+可通过环境变量 `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL=1` 返回空（调试用）。
 
-### 6.2 Context IDs
+## 7. 优雅降级
 
-`ContextRegistry` does not create real CUDA contexts on the client. It allocates stable `context_id` values to:
+如果 daemon socket 不可达：
+- `connectToDaemon()` 返回 false
+- `schedRequest()` 返回 true（批准）
+- 所有操作直接在真实驱动上执行
 
-- Organize requests by device dimension.
-- Provide consistent request identifiers shared by Runtime and Driver paths.
-- Improve server-side log correlation.
+系统在有/无 daemon 时行为完全一致——daemon 只在存在时增加调度。
 
-## 7. Protocol
+## 8. 配置
 
-Two core enums in `protocol.h`:
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `GPU_SCHEDULER_SOCKET` | `/tmp/vgpu_control.sock` | daemon socket 路径 |
+| `GPU_SCHEDULER_MEM_LIMIT_MB` | 无限制 | 每客户端显存上限 |
+| `GPU_SCHEDULER_CONTEXT_OVERHEAD_MB` | 800 | 预扣 context 开销 |
+| `GPU_SCHEDULER_MAX_KERNELS` | 1 | 全局并发 kernel 上限 |
+| `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局并发 memcpy 上限（0=不限制） |
+| `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询间隔（μs） |
+| `GPU_SCHEDULER_VERBOSE` | 0 | 调度日志 |
+| `GPU_SCHEDULER_CONTROL_MEMCPY` | 0 | 客户端是否让 memcpy 路径走 daemon |
 
-- `RpcOp` — Runtime main paths and common queries.
-- `RpcDrvOp` — Driver module, memory, launch paths.
+## 9. 已知局限
 
-**Request:**
-- `RpcRequestHeader` (magic, version, op, app_id, context_id, device, payload_size)
-- Payload
-- Optional extra payload
+### 9.1 无抢占式调度
 
-**Response:**
-- `RpcResponseHeader` (status, aux_u64, payload_size)
-- Payload
+Daemon 只能在 kernel 启动前阻塞客户端。Kernel 一旦开始执行，daemon 无法中断。
 
-`aux_u64` commonly returns: device count, stream/event pointers, module_id/func_id.
+### 9.2 Memcpy 管控为可选接口
 
-## 8. Fatbin Image Handling
+默认情况下，memcpy 仍可直接透传到真实驱动，以保持低开销。
 
-Fatbin images have two formats:
+当客户端设置 `GPU_SCHEDULER_CONTROL_MEMCPY=1` 后，`cuMemcpyHtoD/DtoH/DtoD`（含 Async）会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝数。
 
-- **Wrapper magic** (`0x466243B1`): 8-byte header followed by pointer to actual fatbin data.
-- **Fatbin magic** (`0xBA55ED50`): Direct fatbin data with header containing size information.
+### 9.3 单 GPU
 
-CUDA 12+ uses an extended header: `u32 magic, u32 version, u64 data_size, u32 unknown, u32 header_size`. Legacy layout uses `u32 header_size @8, u32 data_size @12`.
+不支持多 GPU 调度或隔离。
 
-Parsing logic is in `shim_utils.h` (`resolveRawFatbinPtr`, `fatbinImageSize`), shared between Runtime and Driver shims.
+## 10. 设计亮点
 
-## 9. dlopen Interception
+### 10.1 控制面与执行面分离
 
-`dlopen_hook.cpp` interposes the system `dlopen` and `dlsym` symbols using `LD_PRELOAD`. When a process attempts to load `libcuda.so` or `libcudart.so`, the hook redirects to the shim libraries instead.
+- **控制面（daemon）**：只做审批、计数和限流，不执行 GPU API。
+- **执行面（shim + 真实驱动）**：真正发起 CUDA 调用，保证框架兼容性。
 
-Key implementation details:
-- Uses `dlvsym(RTLD_NEXT, ...)` with `GLIBC_2.2.5` to resolve the original `dlopen` without recursion.
-- Thread-local reentrancy guard prevents infinite recursion.
-- Falls back to loading the original library if shim loading fails.
-- Debug logging controlled by `VGPU_DEBUG` environment variable.
+这使得调度策略和 GPU 执行机制解耦，便于后续迭代策略（配额、优先级、抢占提示）而不破坏执行路径。
 
-## 10. Export Table and Symbol Resolution
+### 10.2 双通路通信（握手慢路径 + 数据快路径）
 
-### 10.1 cuGetProcAddress — Symbol Resolution Strategy
+- **慢路径**：UDS 负责连接建立、生命周期管理、故障检测。
+- **快路径**：共享内存单生产者/单消费者协议，原子状态机完成审批交互。
 
-`cuGetProcAddress` resolves CUDA Driver API symbols using a two-tier strategy:
+该设计兼顾了可管理性（UDS）与低时延（SHM）。
 
-**Intercepted symbols** (memory, kernel launch, modules, streams, events, context, device management): Always resolved from the shim's own `libcuda.so`. These are the operations forwarded over RPC to the server.
+### 10.3 失败优雅降级（Fail-Open）
 
-**Non-intercepted symbols** (export tables, library internals, cuBLAS/cuDNN APIs): Resolved from the real `libcuda.so.1` loaded via `realCudaHandle()`. This lets CUDA libraries like cuBLAS access real driver internals while our intercepted operations remain under RPC control.
+daemon 不可达时 shim 透传真实驱动，业务仍可运行。该模式优先保障可用性，适合线上灰度与增量部署。
 
-The real `libcuda.so.1` is loaded with `RTLD_LOCAL`, so its internal function calls use its own GOT and do not re-enter the shim. This prevents circular interception.
+### 10.4 面向扩展的操作语义
 
-**Optional symbols** (Graph, stream capture, occupancy, etc.): Controlled by `VGPU_EXPOSE_OPTIONAL_CUDA_SYMBOLS`. In strict mode (default), these are not resolved, preventing frameworks from taking unsupported code paths.
+`SchedOp` 抽象了调度事件（ALLOC/KERNEL/MEMCPY），后续可自然扩展到 memcpy 带宽、图执行（CUDA Graph）和多设备策略。
 
-### 10.2 cuGetExportTable — Export Table Forwarding
+## 11. 正确性不变量
 
-`cuGetExportTable` forwards to the real driver by default when `realCudaHandle()` is available. This is necessary because cuBLAS requires real export tables to function.
+以下不变量用于约束实现和测试：
 
-Priority order:
-1. `VGPU_USE_FAKE_CU_EXPORT_TABLES=1` — explicit override, use fake tables
-2. `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL=1` — explicit override, return null
-3. Real driver available — forward to real `cuGetExportTable` (default)
-4. No real driver — return `CUDA_ERROR_NOT_SUPPORTED`
+1. **状态机安全性**：请求完成后通道必须回到 `IDLE`，否则后续请求不得覆盖旧状态。
+2. **内存配额单调性**：审批前不得突破配额上限；释放路径不得使统计出现负值。
+3. **并发计数非负性**：`active_kernels`、`active_memcpy` 在任何时刻均应满足 $\ge 0$。
+4. **客户端死亡可回收性**：检测到断连后，必须清理客户端状态与共享内存映射。
+5. **降级可用性**：daemon 不可用时，核心 CUDA 路径仍应可运行。
 
-## 11. Current Limitations and Future Work
+建议后续将这些不变量映射到自动化测试命名中，形成“性质-用例”一一对应关系。
 
-### 11.1 Frontend files are large
+## 12. 评估方法（工程 + 学术）
 
-`interceptor.cpp` and `driver_interceptor.cpp` each contain core forwarding logic, compatibility stubs, and debug diagnostics in a single file. A natural next step would be splitting each into:
-- Core forwarding functions
-- Compatibility stubs
-- Debug / diagnostic helpers
+建议将实验拆分为三个维度：
 
-### 11.2 Server dispatch is monolithic
+1. **性能开销**
+- 空载开销：只加载 shim、不启调度的基线延迟。
+- 调度开销：开启 daemon 后 `cuMemAlloc/cuLaunchKernel/cuMemcpy` 的新增时延。
 
-`server_main.cpp` handles all request types in one dispatch function. Could be split into:
-- Runtime memory operations
-- Runtime stream/event operations
-- Driver module operations
-- Driver memory operations
+2. **隔离与公平性**
+- 多进程竞争下每个客户端的吞吐和尾延迟（P95/P99）。
+- 不同配额策略下的资源占用公平度（如 Jain 指数）。
 
-### 11.3 Capability matrix should track tests
+3. **鲁棒性**
+- daemon 异常退出/重启后的任务行为。
+- 客户端崩溃后的状态回收时延。
 
-The most likely source of drift is documentation not matching implementation. README capability claims, DESIGN compatibility strategy, and test assertions should be maintained together.
+可将结果统一报告为：吞吐、时延分位、拒绝率、恢复时间。
 
-### 11.4 cuBLAS / cuDNN via real driver passthrough
+## 13. 优化路线图
 
-cuBLAS and cuDNN work through a hybrid approach: their internal CUDA Driver API calls (export tables, context management) are resolved from the real `libcuda.so.1`, while memory allocation and kernel launch go through the vGPU server via RPC.
+### 13.1 短期（可快速落地）
 
-This is not a full proxy — cuBLAS/cuDNN use the real driver for internal operations directly. The benefit is that cuBLAS/cuDNN work out of the box without implementing RPC proxies for their complex internal APIs. The limitation is that they require a real GPU on the same machine.
+1. 将 kernel 完成语义从“launch 返回即完成”升级为“基于 event/stream 观测完成”。
+2. 扩展 memcpy 管控到 2D/3D/Peer/Batch 系列接口。
+3. 增加更细粒度日志开关（请求采样率、按 op 分类）。
 
-Currently, export table stubs only satisfy initialization probing, not actual computation.
+### 13.2 中期（增强策略能力）
+
+1. 引入 token-bucket 带宽调度，替代单纯并发数限制。
+2. 支持按客户端优先级和权重进行加权公平调度。
+3. 增加策略插件化接口，支持不同策略热切换。
+
+### 13.3 长期（体系能力）
+
+1. 多 GPU 拓扑感知调度（NUMA/NVLink 约束）。
+2. 与容器/runtime 集成（cgroup + device plugin）实现租户级隔离。
+3. 形成可复现实验基准套件，支撑论文与工程发布。
