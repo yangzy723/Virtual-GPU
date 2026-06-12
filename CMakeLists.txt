@@ -35,8 +35,8 @@ if(VGPU_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
         add_custom_target(scheduler_test
-            COMMAND ${Python3_EXECUTABLE} -m pytest
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vgpu.py -v
+            COMMAND ${Python3_EXECUTABLE} -m unittest -v
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vgpu.py
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             DEPENDS gpu_scheduler vgpu_cuda_driver_shim
             USES_TERMINAL

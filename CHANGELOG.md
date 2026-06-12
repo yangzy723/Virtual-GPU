@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Extended memcpy scheduling coverage to generic, peer, 2D, and 3D Driver API copy paths, including async and `_v2` variants where applicable.
+- Added event-based completion reporting for `cuLaunchKernel`, `cuLaunchKernelEx`, and async memcpy paths, with API-return fallback if private event tracking is unavailable.
+- Added scheduling for CUDA 13 `cuMemcpyBatchAsync_v2`; older Batch signatures and 3D Batch remain pass-through.
+- Delayed `cuMemFreeAsync` FREE accounting until the freeing stream reaches a private completion event, with API-return fallback.
+- Added an explicit one-time stderr warning when the shim enters fail-open passthrough because the scheduler daemon is unavailable or unresponsive.
+- Added scheduling for common `cuMemsetD*` and `cuMemsetD2D*` Driver API paths, including async variants.
+
 ## [0.3.2] - 2026-05-03
 
 ### Changed

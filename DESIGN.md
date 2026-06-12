@@ -49,7 +49,9 @@ Daemon 从不执行 GPU 操作，只做调度决策：
 1. **客户端请求** — shim 写入共享内存，设置 state 为 PENDING
 2. **Daemon 决策** — 轮询共享内存，设置 state 为 APPROVED 或 REJECTED
 3. **客户端执行** — shim 读取响应，调用真实 CUDA 函数
-4. **完成报告** — shim 发送 FREE 或 KERNEL_COMPLETE，daemon 重置 state 为 IDLE
+4. **完成报告** — shim 发送 FREE、KERNEL_COMPLETE 或 MEMCPY_COMPLETE，daemon 重置 state 为 IDLE
+
+完成语义分两类：同步 CUDA API 按 API 返回上报；`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy/memset 与 `cuMemFreeAsync` 在真实 API 成功入队后，由 shim 记录私有 CUDA event，后台线程通过 `cuEventQuery` 观测 stream 完成后再上报。若 event 创建/记录不可用，则回退为 API-return 上报，优先避免 daemon 计数泄漏。
 
 ### 4.2 通信：共享内存
 
@@ -116,7 +118,9 @@ Daemon 追踪每客户端状态：
 - `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` — 异步显存分配
 - `cuMemFree` / `cuMemFree_v2` — 显存释放
 - `cuMemFreeAsync` — 异步显存释放
-- `cuMemcpyHtoD/DtoH/DtoD`（含 `_v2` 与 Async）— memcpy 调度
+- `cuMemcpy*`、`cuMemcpyPeer*`、`cuMemcpy2D*`、`cuMemcpy3D*`（含 `_v2` 与 Async）— memcpy 调度
+- `cuMemcpyBatchAsync_v2` — CUDA 13 pointer batch memcpy 调度
+- `cuMemsetD*` / `cuMemsetD2D*`（含 Async）— memset 调度，复用 memcpy 并发预算
 - `cuLaunchKernel` — kernel 启动
 - `cuLaunchKernelEx` / `cuLaunchKernelExC` — 新版 kernel 启动接口
 - `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作
@@ -126,8 +130,8 @@ Daemon 追踪每客户端状态：
 - Context 操作（`cuCtxCreate`、`cuCtxSetCurrent` 等）
 - Device 操作（`cuDeviceGet`、`cuDeviceGetAttribute` 等）
 - Module 操作（`cuModuleLoad`、`cuModuleGetFunction` 等）
-- Event 操作（`cuEventCreate`、`cuEventRecord` 等）
-- Memset 及其他未纳入调度集合的 Driver API
+- Event 操作（`cuEventCreate`、`cuEventRecord` 等；用户显式 event API 透传，shim 私有 event 仅用于完成观测）
+- 其他未纳入调度集合的 Driver API
 
 LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态解析走正确路径。
 
@@ -137,8 +141,8 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 |---|---|---|---|---|
 | 显存分配 | `cuMemAlloc*` | shim 拦截 | 是 | 受显存配额限制 |
 | 显存释放 | `cuMemFree*` | shim 拦截 | 是（报告） | 释放后更新统计 |
-| Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | 当前完成语义为 launch-return |
-| Memcpy | `cuMemcpyHtoD/DtoH/DtoD`（含 Async） | shim 拦截 | 是 | 完成语义为 API-return |
+| Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | `cuLaunchKernel/cuLaunchKernelEx` 优先 event 完成；`ExC` 为 API-return |
+| Memcpy/Memset | `cuMemcpy*`、`cuMemcpyPeer*`、`cuMemcpy2D*`、`cuMemcpy3D*`（含 Async）、`cuMemcpyBatchAsync_v2`、`cuMemsetD*`/`cuMemsetD2D*` | shim 拦截 | 是 | Async 优先 event 完成；同步为 API-return；memset 复用 memcpy 并发预算；旧 Batch 与 3D Batch 暂不覆盖 |
 | Stream | `cuStream*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | Event | `cuEvent*` | shim 拦截 | 否 | 直接透传真实驱动 |
 | 其余 Driver API | 如 `cuDevice*`、`cuModule*` | 转发真实驱动 | 否 | 维持兼容性优先 |
@@ -177,6 +181,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 
 如果 daemon socket 不可达：
 - `connectToDaemon()` 返回 false
+- shim 向 stderr 打印一次明确 warning：调度不可用，进入 fail-open passthrough
 - `schedRequest()` 返回 true（批准）
 - 所有操作直接在真实驱动上执行
 
@@ -192,6 +197,7 @@ LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态�
 | `GPU_SCHEDULER_MAX_KERNELS` | 1 | 全局并发 kernel 上限 |
 | `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局并发 memcpy 上限（0=不限制） |
 | `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询间隔（μs） |
+| `GPU_SCHEDULER_COMPLETION_POLL_US` | 100 | shim 轮询私有 CUDA event 完成状态的间隔（μs） |
 | `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
 | `GPU_SCHEDULER_VERBOSE` | 0 | 调度日志 |
 
@@ -203,9 +209,13 @@ Daemon 只能在 kernel 启动前阻塞客户端。Kernel 一旦开始执行，d
 
 ### 9.2 Memcpy 管控覆盖范围
 
-`cuMemcpyHtoD/DtoH/DtoD`（含 Async）会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝数。
+常见 `cuMemcpy*`、`cuMemcpyPeer*`、2D/3D 拷贝（含 Async）、CUDA 13 `cuMemcpyBatchAsync_v2` 与常见 `cuMemsetD*`/`cuMemsetD2D*` 会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝/写入数。旧 `cuMemcpyBatchAsync` 签名、`cuMemcpy3DBatchAsync*`、prefetch/discard 等仍未纳入管控。
 
-### 9.3 单 GPU
+### 9.3 完成语义边界
+
+`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy、Async memset 和 `cuMemFreeAsync` 优先基于私有 event 观测 stream 完成。event 路径不可用时回退 API-return；`cuLaunchKernelExC`、同步 memcpy/memset、同步显存释放等仍按 API-return/调用返回语义上报。
+
+### 9.4 单 GPU
 
 不支持多 GPU 调度或隔离。
 
@@ -267,8 +277,8 @@ daemon 不可达时 shim 透传真实驱动，业务仍可运行。该模式优�
 
 ### 13.1 短期（可快速落地）
 
-1. 将 kernel 完成语义从“launch 返回即完成”升级为“基于 event/stream 观测完成”。
-2. 扩展 memcpy 管控到 2D/3D/Peer/Batch 系列接口。
+1. 扩展 event 完成观测到 `cuLaunchKernelExC`、CUDA Graph launch 和更多 stream-ordered 操作。
+2. 在确认版本 ABI 后扩展旧 Batch、3D Batch、prefetch/discard 等接口管控。
 3. 增加更细粒度日志开关（请求采样率、按 op 分类）。
 
 ### 13.2 中期（增强策略能力）
