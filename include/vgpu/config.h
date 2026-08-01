@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -81,6 +82,20 @@ inline std::string getEnvOrConfig(const char* key, const std::string& fallback =
     if (it != values().end()) return it->second;
 
     return fallback;
+}
+
+inline int getInt(const char* key, int fallback, int minimum, int maximum) {
+    const std::string raw = getEnvOrConfig(key);
+    if (raw.empty()) return fallback;
+
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw.c_str(), &end, 10);
+    if (errno == ERANGE || end == raw.c_str() || *end != '\0' ||
+        parsed < minimum || parsed > maximum) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
 }
 
 inline bool getBool(const char* key, bool fallback = false) {

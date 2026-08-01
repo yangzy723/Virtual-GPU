@@ -23,6 +23,9 @@ target_link_libraries(gpu_scheduler PRIVATE pthread)
 
 add_library(vgpu_cuda_driver_shim SHARED
     src/shim/intercept.cpp
+    src/shim/daemon_channel.cpp
+    src/shim/local_scheduler.cpp
+    src/shim/scheduler_backend.cpp
 )
 set_target_properties(vgpu_cuda_driver_shim PROPERTIES OUTPUT_NAME cuda)
 target_include_directories(vgpu_cuda_driver_shim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -32,13 +35,26 @@ target_compile_definitions(vgpu_cuda_driver_shim PRIVATE _GNU_SOURCE)
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 if(VGPU_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(local_scheduler_test
+        tests/local_scheduler_test.cpp
+        src/shim/local_scheduler.cpp
+    )
+    target_include_directories(local_scheduler_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/shim
+    )
+    target_link_libraries(local_scheduler_test PRIVATE pthread)
+    add_test(NAME local_scheduler_test COMMAND local_scheduler_test)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
         add_custom_target(scheduler_test
-            COMMAND ${Python3_EXECUTABLE} -m unittest -v
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vgpu.py
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vgpu.py -v
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-            DEPENDS gpu_scheduler vgpu_cuda_driver_shim
+            DEPENDS gpu_scheduler vgpu_cuda_driver_shim local_scheduler_test
             USES_TERMINAL
         )
     endif()

@@ -1,185 +1,153 @@
-# GPU Scheduler
+# vGPU CUDA Driver Scheduling Shim
 
-单 GPU 多进程调度层。通过 `LD_PRELOAD` 拦截 CUDA Driver API，协调多个进程共享一块 GPU。
+一个面向单机单 GPU 实验的 CUDA Driver API 调度层。项目通过 `LD_PRELOAD` 接管选定的 `libcuda` 符号，在调用真实 NVIDIA Driver 前执行资源审批；GPU 工作始终由客户端进程提交，daemon 不执行 CUDA API。
+
+> 当前状态：工程/研究原型。它提供调用级 admission control 和计数，不是硬件虚拟化、显存安全隔离或可抢占 GPU 调度器。
+
+## 能力与模式
+
+| 模式 | 配置 | 调度范围 | 通信 | 资源满时行为 |
+|---|---|---|---|---|
+| daemon | `VGPU_SCHEDULER_MODE=daemon`（默认） | 多进程统一计数与审批 | UDS 注册 + 每客户端 SHM | 当前协议返回拒绝；shim 映射为对应 CUDA 错误 |
+| local | `VGPU_SCHEDULER_MODE=local` | 当前进程内各线程 | 无 socket/SHM | kernel/memcpy 等待本地槽位；显存超配额返回 OOM |
+| daemon fail-open | daemon 不可达或响应超时 | 不再调度 | 连接尝试失败 | stderr 警告一次后透传真实驱动 |
+
+`VGPU_LOCAL_MODE=1` 仅作为旧配置的兼容别名，等价于 `VGPU_SCHEDULER_MODE=local`。新部署应使用显式 mode。
 
 ## 架构
 
+```text
+CUDA application / PyTorch / cuBLAS
+                 │ Driver API
+                 ▼
+       LD_PRELOAD: build/libcuda.so
+                 │
+       ┌─────────┴─────────┐
+       │ scheduler backend │
+       ├───────────────────┤
+       │ local             │ 进程内 mutex/CV、配额与并发计数
+       │ daemon            │ UDS 握手、SHM 原子状态机、fail-open
+       └─────────┬─────────┘
+                 │ approved
+                 ▼
+          real libcuda.so.1 ──▶ GPU
 ```
-进程 A ──拦截──┐
-               ├──▶ 同一个 daemon（统一审批）
-进程 B ──拦截──┘                 │
-                                ├─批准──▶ 客户端调用真实 GPU
-                                └─拒绝──▶ 客户端阻塞等待
-```
 
-**核心洞察**：CUDA Runtime API (`libcudart`) 内部调用 Driver API (`libcuda`)。优先拦截 `libcuda.so` 即可覆盖绝大多数框架主路径（含 PyTorch 常见路径）。对 cuBLAS/cuDNN 等库，未拦截符号保持透传真实驱动。
+代码边界：
 
-**调度模型**：daemon 只做审批决策，不执行任何 GPU 操作。所有 GPU 计算在本地真实驱动上执行。
+- `src/shim/intercept.cpp`：CUDA ABI 包装、真实符号转发、异步完成事件。
+- `src/shim/scheduler_backend.*`：mode 解析与统一 request/report 入口。
+- `src/shim/local_scheduler.*`：无通信的进程内 admission scheduler。
+- `src/shim/daemon_channel.*`：UDS/SHM 客户端协议和 fail-open。
+- `src/daemon/`：多客户端生命周期、配额和并发审批。
 
-**通信机制**：UDS 握手建立连接，之后请求走共享内存原子状态机。
+更完整的不变量与完成语义见 [DESIGN.md](DESIGN.md)。
 
-**优雅降级**：daemon 未运行时，重操作会 fail-open 到真实驱动，保证可用性优先（仍保留 shim 自身的轻微拦截开销）。
+## 构建
 
-## 版本
-
-- 当前版本：`0.3.2`（见 `VERSION`）
-- 变更记录：`CHANGELOG.md`
-
-## 快速开始
-
-### 构建
+要求 Linux、CMake 3.18+、C++17，以及运行时可见的 NVIDIA Driver。构建 shim 本身不依赖 CUDA Toolkit 头文件。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-### 启动 daemon
+产物：
 
-```bash
-./build/gpu_scheduler &
-```
+- `build/libcuda.so`：供 `LD_PRELOAD` 使用的 shim。
+- `build/gpu_scheduler`：daemon 后端。
+- `build/local_scheduler_test`：不依赖 GPU 的本地调度单元测试。
 
-### 运行带调度的程序
+## 快速使用
 
-```bash
-LD_PRELOAD=build/libcuda.so python your_script.py
-```
-
-### 两个进程共享一块 GPU
-
-```bash
-# 终端 1
-LD_PRELOAD=build/libcuda.so python -c "
-import torch
-a = torch.randn(1000, 1000, device='cuda')
-b = torch.matmul(a, a)
-print('P1 ok', b.shape)"
-
-# 终端 2（同时运行）
-LD_PRELOAD=build/libcuda.so python -c "
-import torch
-a = torch.randn(1000, 1000, device='cuda')
-b = torch.matmul(a, a)
-print('P2 ok', b.shape)"
-```
-
-### 一键演示（自动启动 daemon + 跑 matmul + 验证拦截）
-
-```bash
-./scripts/run_matmul_demo.sh
-```
-
-脚本会输出两段关键信息：
-1. 客户端侧 `daemon request/approved` 与 `matmul ok`
-2. daemon 侧 `ALLOC_REQUEST/KERNEL_REQUEST/KERNEL_COMPLETE` 记录
-
-如果日志里缺少 matmul 成功标记或 kernel 调度记录，脚本会非零退出。可用 `PYTHON_BIN=/path/to/python` 指定带 PyTorch 的解释器。
-
-## 配置文件（推荐）
-
-项目支持统一配置文件，减少大量环境变量配置。
-
-默认查找顺序：
-1. `GPU_SCHEDULER_CONFIG` 指定的路径
-2. `./vgpu.conf`
-3. `./config/vgpu.conf`
-4. `/etc/vgpu.conf`
-
-示例配置文件：`config/vgpu.conf.example`
+### 多进程 daemon 模式
 
 ```bash
 cp config/vgpu.conf.example config/vgpu.conf
 ./build/gpu_scheduler &
-LD_PRELOAD=build/libcuda.so python your_script.py
+SCHEDULER_PID=$!
+
+VGPU_SCHEDULER_MODE=daemon \
+LD_PRELOAD="$PWD/build/libcuda.so" \
+python your_workload.py
+
+kill "$SCHEDULER_PID"
 ```
 
-环境变量仍可用于临时覆盖配置文件中的同名项。
+也可运行带日志校验的一键示例：
 
-## 环境变量（可选覆盖）
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `GPU_SCHEDULER_SOCKET` | `/tmp/vgpu_control.sock` | daemon socket 路径 |
-| `GPU_SCHEDULER_MEM_LIMIT_MB` | 无限制 | 每客户端显存上限（MB） |
-| `GPU_SCHEDULER_CONTEXT_OVERHEAD_MB` | 800 | 每客户端预扣 context 开销（MB） |
-| `GPU_SCHEDULER_MAX_KERNELS` | 1 | 全局最大并发 kernel 数 |
-| `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局最大并发 memcpy 数（0=不限制） |
-| `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询共享内存间隔（微秒） |
-| `GPU_SCHEDULER_COMPLETION_POLL_US` | 100 | shim 轮询私有 CUDA event 完成状态的间隔（微秒） |
-| `GPU_SCHEDULER_VERBOSE` | 0 | 输出调度日志 |
-| `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
-| `GPU_SCHEDULER_CONFIG` | 无 | 指定配置文件路径 |
-| `VGPU_TRACE` | 1 | shim trace 输出开关 |
-
-## 组件
-
-| 组件 | 源码 | 说明 |
-|---|---|---|
-| `gpu_scheduler` | `src/daemon/` | 调度 daemon — 只做审批，不碰 GPU |
-| `libcuda.so` | `src/shim/intercept.cpp` | Driver API shim（LD_PRELOAD） |
-| `scripts/run_matmul_demo.sh` | `scripts/` | 一键演示脚本（构建+运行+日志摘要） |
-| `config/vgpu.conf.example` | `config/` | 配置文件模板 |
-
-## 目录结构
-
-```text
-vGPU/
-    include/vgpu/         # 协议与最小 CUDA ABI 类型
-    src/daemon/           # daemon 调度与生命周期管理
-    src/shim/             # libcuda.so 拦截与转发
-    scripts/              # 一键运行与调试脚本
-    tests/                # unittest 回归
+```bash
+PYTHON_BIN=/path/to/python-with-torch ./scripts/run_matmul_demo.sh
 ```
 
-## 工作原理
+### 无 socket 的本地模式
 
-1. Shim 库通过 `LD_PRELOAD` 优先接管 CUDA Driver API 符号，并覆写 `dlsym`/`cuGetProcAddress*` 以路由动态解析
-2. **重操作**（`cuMemAlloc*`、`cuLaunchKernel*`、`cuMemcpy*`、`cuMemset*`）：shim 写入共享内存，原子自旋等待 daemon 决策，然后调用真实 CUDA 函数
-3. **轻操作**（`cuDeviceGetAttribute`、`cuStreamCreate` 等）：shim 直接调用真实 CUDA 函数
-4. **完成上报**：同步路径按 API-return 上报；`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy/memset 与 `cuMemFreeAsync` 成功入队后，shim 记录私有 CUDA event，后台线程通过 `cuEventQuery` 观测到 stream 完成后再上报
-5. **Daemon** 通过轮询共享内存追踪每客户端的显存用量、活跃 kernel 数和活跃 memcpy 数
-6. Daemon 不可达时，shim **降级**为直接调用真实驱动，并向 stderr 打印一次明确的 fail-open warning
+```bash
+VGPU_SCHEDULER_MODE=local \
+GPU_SCHEDULER_MAX_KERNELS=8 \
+LD_PRELOAD="$PWD/build/libcuda.so" \
+python your_workload.py
+```
 
-## 符号拦截策略
+local 模式不会连接 daemon。它只协调一个进程内的调用。
 
-只拦截需要调度逻辑的符号：
+## 配置
 
-- `cuMemAlloc` / `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` / `cuMemFree` / `cuMemFreeAsync` — 显存分配/释放
-- `cuLaunchKernel` / `cuLaunchKernelEx` / `cuLaunchKernelExC` — kernel 启动（`ExC` 当前完成上报仍按 API-return）
-- `cuMemcpy*`、`cuMemcpyPeer*`、`cuMemcpy2D*`、`cuMemcpy3D*`（含 Async）— 主存/显存拷贝（始终走 daemon 调度）
-- `cuMemcpyBatchAsync_v2` — CUDA 13 `_v2` pointer batch 拷贝（旧 `cuMemcpyBatchAsync` 签名和 `cuMemcpy3DBatchAsync*` 暂不拦截）
-- `cuMemsetD*` / `cuMemsetD2D*`（含 Async）— 设备显存写入（复用 memcpy 并发预算）
-- `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作（当前仅透传，便于后续扩展）
-- `cuGetProcAddress` — 动态符号解析路由
-- `dlsym` — 动态符号查询入口（用于将 `cuGetProcAddress*` 查询导向 shim）
+配置查找顺序为 `GPU_SCHEDULER_CONFIG` 指定路径、`./vgpu.conf`、`./config/vgpu.conf`、`/etc/vgpu.conf`。环境变量覆盖文件中的同名键。
 
-默认不 hook `dlopen`（兼容性优先）；当框架通过 `dlsym` + `cuGetProcAddress*` 解析 CUDA 符号时，仍可被当前路径覆盖。
+| 变量 | 默认值 | 适用范围 | 说明 |
+|---|---:|---|---|
+| `VGPU_SCHEDULER_MODE` | `daemon` | shim | `daemon` 或 `local` |
+| `GPU_SCHEDULER_SOCKET` | `/tmp/vgpu_control.sock` | daemon | UDS 路径 |
+| `GPU_SCHEDULER_MEM_LIMIT_MB` | `0` | 两种后端 | 显存记账上限；0 表示无限制 |
+| `GPU_SCHEDULER_CONTEXT_OVERHEAD_MB` | `800` | 两种后端 | 注册/初始化时的记账预扣，不会实际分配显存 |
+| `GPU_SCHEDULER_MAX_KERNELS` | `1` | 两种后端 | 活跃 kernel 上限 |
+| `GPU_SCHEDULER_MAX_MEMCPY` | `0` | 两种后端 | 活跃 memcpy/memset 上限；0 表示无限制 |
+| `GPU_SCHEDULER_POLL_US` | `100` | daemon | daemon SHM 轮询间隔 |
+| `GPU_SCHEDULER_COMPLETION_POLL_US` | `100` | shim | 私有 CUDA event 查询间隔 |
+| `GPU_SCHEDULER_WAIT_ITERS` | `200000` | daemon client | SHM 状态等待迭代预算 |
+| `GPU_SCHEDULER_VERBOSE` | `0` | 两种后端 | 后端级日志 |
+| `VGPU_TRACE` | `1` | shim | API/传输 trace；性能测试建议设为 0 |
 
-其余符号（context、device、module、event 与未覆盖 Driver API）直接透传到真实驱动。shim 内部会创建私有 event 做完成观测；用户显式调用的 event API 仍是透传。
+示例见 `config/vgpu.conf.example`。
+
+## 拦截范围与语义
+
+当前调度集合包括：
+
+- `cuMemAlloc*` / `cuMemFree*`：配额记账和释放上报。
+- `cuLaunchKernel*`：kernel admission；常用异步入口通过私有 CUDA event 上报完成。
+- 常用 `cuMemcpy*`、peer、2D/3D、`cuMemcpyBatchAsync_v2`：复用 memcpy 并发预算。
+- 常用 `cuMemsetD*` / `cuMemsetD2D*`：复用 memcpy 并发预算。
+
+未列入集合的 Driver API 通常透传真实驱动。同步接口在 API 返回时上报；异步接口优先在对应 stream 上记录私有 event，并由后台线程在 event 完成后上报。event 创建或记录失败时回退为 API-return 上报。具体覆盖矩阵见设计文档。
 
 ## 测试
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-python -m unittest -v tests/test_vgpu.py
+ctest --test-dir build --output-on-failure
+python tests/test_vgpu.py -v
 ```
 
-如需指定运行 PyTorch 客户端脚本的解释器，可设置 `VGPU_TEST_PYTHON=/path/to/python`。
+完整 CUDA/PyTorch 用例需要安装 Torch 的解释器：
 
-测试项：
-1. daemon 启停
-2. `cuGetProcAddress` 对被调度符号的路由
-3. fail-open warning
-4. 带/不带 daemon 的 torch.matmul
-5. kernel/memcpy/memset 调度路径
-6. 多客户端并发
+```bash
+VGPU_TEST_PYTHON=/path/to/python-with-torch python tests/test_vgpu.py -v
+```
 
-## 已知局限
+测试覆盖本地配额与槽位等待、daemon 生命周期、SHM 调度路径、fail-open warning、动态符号路由、多客户端以及可用时的 PyTorch GEMM。
 
-- **无抢占式调度**：daemon 只能在 kernel 启动前阻塞客户端，无法中断正在执行的 kernel
-- **Memcpy/Memset 管控粒度有限**：当前覆盖常见 `cuMemcpy*`、`cuMemcpyPeer*`、2D/3D 拷贝（含 Async）、CUDA 13 `cuMemcpyBatchAsync_v2` 与常见 `cuMemsetD*`/`cuMemsetD2D*`；旧 Batch 签名、3D Batch、prefetch/discard 等仍未纳入管控
-- **Fail-open 会显式提示**：daemon 不可达、握手失败或调度等待超时时，shim 会在 stderr 打印一次 `[vGPU warning] scheduler unavailable, fail-open passthrough...`，随后透传真实驱动
-- **完成语义仍有边界**：`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy/memset 和 `cuMemFreeAsync` 优先基于私有 event/stream 完成上报；event 创建或记录失败时回退到 API-return。`cuLaunchKernelExC`、同步 memcpy/memset、同步显存释放等仍按 API-return/调用返回语义上报
-- **单 GPU**：不支持多 GPU 调度或隔离
+## 基准与结果
+
+- `scripts/benchmark_gemm_overhead.py`：纯 GEMM A/B harness；用完全相同的参数分别在无 shim 和 `LD_PRELOAD` 下运行，输出 wall/GPU 时间与 P95。
+
+GreenCtx 创建/销毁、池化、policy 扫描以及 MPS/GreenCtx resident-memory 都是独立 workload 实验，已迁移到配套 CoGPU 仓库的 `eval/overhead/`。此前四组混合场景数据也随脚本迁移，本仓库不再把它们标记为纯拦截开销。
+
+## 已知边界
+
+- 只在单 GPU 环境验证；daemon 的并发计数当前不是按 device 分桶。
+- 无运行中 kernel 抢占，也不提供 SM、带宽或显存地址空间的强隔离。
+- daemon 达到并发上限时目前拒绝请求，不维护跨客户端等待队列。
+- fail-open 优先可用性，不适用于必须 fail-closed 的强隔离场景。
+- CUDA Graph、旧 batch/3D batch、prefetch/discard 等路径尚未完整纳入。
+- `cuLaunchKernelExC` 和部分同步/兼容入口仍按 API-return 完成语义记账。

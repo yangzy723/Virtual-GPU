@@ -1,294 +1,156 @@
-# 设计文档
+# vGPU 设计文档
 
-## 1. 目标
+## 1. 目标与非目标
 
-让多个进程共享一块 GPU。Daemon 作为门卫（gatekeeper），追踪资源使用并决定每个进程何时可以执行。所有 GPU 操作在本地真实驱动上执行。
+vGPU 在 CUDA Driver API 调用前增加一个小型 admission-control 层，支持两种部署：单进程本地调度，以及由 daemon 统一协调多进程。执行面始终是客户端与真实 `libcuda.so.1`。
 
-## 2. 核心洞察
+本项目不试图实现：GPU 指令级抢占、显存地址空间隔离、MIG/MPS 替代品、容器安全边界，或未经覆盖的所有 CUDA API 的透明虚拟化。
 
-CUDA Runtime API (`libcudart`) 是 Driver API (`libcuda`) 的薄封装。PyTorch 调用 `cudaMalloc` 时，libcudart 内部调用 `cuMemAlloc`；调用 `cudaLaunchKernel` 时，内部调用 `cuLaunchKernel`。
+## 2. 组件边界
 
-通过 `LD_PRELOAD` 拦截 `libcuda.so`，可以覆盖 CUDA Driver API 的主路径调用（PyTorch 等框架常见路径）。对 cuBLAS/cuDNN，关键在于未拦截符号可继续转发到真实驱动。这意味着：
-
-- **无需拦截 libcudart** — 避免 SONAME 冲突和转发桩
-- **通常无需 hook dlopen** — 真实 libcudart 正常加载
-- **覆盖边界清晰** — 以 `cuGetProcAddress` 和显式导出符号为主，少数非常规解析路径可能需要额外 hook 策略
-
-## 3. 系统架构
-
-```
-┌─────────────┐    ┌─────────────┐
-│   进程 A     │    │   进程 B     │
-│  (PyTorch)  │    │  (cuBLAS)   │
-└──────┬──────┘    └──────┬──────┘
-       │                  │
-       ▼                  ▼
-┌──────────────────────────────────┐
-│  LD_PRELOAD: libcuda.so (shim)   │
-│                                  │
-│  重操作 → 共享内存 → daemon 审批  │
-│  轻操作 → 直接调用真实驱动        │
-└──────────┬───────────────────────┘
-           │
-           ▼
-┌──────────────────────┐     ┌──────────────────┐
-│  gpu_scheduler       │     │  真实 libcuda.so.1│
-│  (daemon, 不碰 GPU)  │     │  (NVIDIA 驱动)    │
-│                      │     │                   │
-│  轮询共享内存         │     │  执行 GPU 操作     │
-│  做审批决策           │     │                   │
-└──────────────────────┘     └──────────────────┘
+```text
+intercept.cpp
+  ├─ real CUDA symbol loader / ABI wrappers
+  ├─ allocation metadata
+  └─ asynchronous completion observer
+             │ request / report
+             ▼
+scheduler_backend.cpp
+  ├─ LocalScheduler      (in-process)
+  └─ DaemonChannel       (UDS registration + SHM protocol)
+                              │
+                              ▼
+                    gpu_scheduler daemon
 ```
 
-## 4. 调度模型
+`intercept.cpp` 不再包含 socket 或 SHM 状态机。`DaemonChannel` 独占通信状态；`LocalScheduler` 不包含 CUDA 和 IPC 依赖，因此可以独立单元测试。
 
-### 4.1 门卫模式
+## 3. 后端选择
 
-Daemon 从不执行 GPU 操作，只做调度决策：
+shim 第一次进入调度路径时读取配置并固定进程生命周期内的 mode：
 
-1. **客户端请求** — shim 写入共享内存，设置 state 为 PENDING
-2. **Daemon 决策** — 轮询共享内存，设置 state 为 APPROVED 或 REJECTED
-3. **客户端执行** — shim 读取响应，调用真实 CUDA 函数
-4. **完成报告** — shim 发送 FREE、KERNEL_COMPLETE 或 MEMCPY_COMPLETE，daemon 重置 state 为 IDLE
+1. `VGPU_SCHEDULER_MODE=local|daemon`。
+2. 未设置时，兼容检查 `VGPU_LOCAL_MODE=1`。
+3. 都未设置时使用 `daemon`。
+4. 非法值打印 warning 并回退 `daemon`。
 
-完成语义分两类：同步 CUDA API 按 API 返回上报；`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy/memset 与 `cuMemFreeAsync` 在真实 API 成功入队后，由 shim 记录私有 CUDA event，后台线程通过 `cuEventQuery` 观测 stream 完成后再上报。若 event 创建/记录不可用，则回退为 API-return 上报，优先避免 daemon 计数泄漏。
+固定 mode 避免运行中切换导致已有 active 计数被另一个后端接管。
 
-### 4.2 通信：共享内存
+## 4. 本地调度
 
-每个客户端有专属的共享内存通道（daemon 在握手时创建）。
+`LocalScheduler` 持有一个 mutex、condition variable 和三类状态：
 
+- `allocated_bytes`：不含固定 context 预扣的动态显存记账。
+- `active_kernels`：已批准且尚未完成的 kernel 数。
+- `active_memcpy`：已批准且尚未完成的 memcpy/memset 数。
+
+行为：
+
+- allocation：在 `context_overhead + allocated + request` 不超过 limit 时批准；超限返回 OOM。
+- kernel：达到上限时在 condition variable 等待，完成上报后唤醒。
+- memcpy：上限为 0 时无限制，否则采用相同的等待语义。
+- FREE/COMPLETE：计数饱和减法，保证状态不为负。
+
+local 后端没有 socket、SHM 或跨进程共享状态。其目标是测量/使用拦截层与进程内策略的成本，而不是提供多进程公平性。
+
+## 5. Daemon 通信与调度
+
+### 5.1 注册慢路径
+
+1. shim 连接 `GPU_SCHEDULER_SOCKET` 指定的 Unix domain socket。
+2. 发送 `HELLO + PID`。
+3. daemon 创建 `/vgpu_PID` POSIX SHM，注册客户端并返回名称。
+4. shim mmap 通道并保留 UDS fd；daemon 通过 fd 的 HUP/断开检测客户端死亡。
+
+### 5.2 请求快路径
+
+每个客户端只有一个 `ShmChannel`，shim 内部 mutex 将并发请求串行化：
+
+```text
+IDLE → client writes op/value/device → PENDING
+PENDING → daemon decision → APPROVED | REJECTED
+APPROVED/REJECTED → client consumes → IDLE
 ```
-ShmChannel (128 字节, cache-line 对齐):
-  atomic<uint32_t> state      — IDLE/PENDING/APPROVED/REJECTED
-  atomic<uint32_t> op         — ALLOC_REQUEST/FREE/KERNEL_REQUEST/KERNEL_COMPLETE
-  atomic<uint64_t> value      — ALLOC 字节数
-  atomic<int32_t>  result     — 0=成功, 负数=错误
-  atomic<uint32_t> device     — GPU 设备号
-  atomic<uint64_t> client_id  — 客户端 PID
-  atomic<uint32_t> dying      — 客户端断开标记
-```
 
-**快路径**：shim 写请求 → 设置 PENDING → 自旋等待 → 读响应。延迟：微秒级。
+FREE/KERNEL_COMPLETE/MEMCPY_COMPLETE 是报告：daemon 更新状态后直接把通道恢复为 IDLE。当前 daemon 在并发槽位满时返回 REJECTED，并未实现等待队列。
 
-**慢路径**：daemon 每 100μs 轮询所有通道。通过 epoll 检测 UDS 连接断开。
+### 5.3 fail-open
 
-轮询间隔可通过 `GPU_SCHEDULER_POLL_US` 调整（默认 100μs）。
+socket、握手、mmap 或 SHM 等待失败时，`DaemonChannel` 只打印一次明确 warning，并允许 CUDA 调用继续执行。该行为是可用性策略，不是隔离保证。local 模式从不进入此路径。
 
-### 4.3 握手协议
+## 6. 协议
 
-1. Shim 通过 UDS 连接 daemon（`/tmp/vgpu_control.sock`）
-2. 发送 HELLO + PID
-3. Daemon 创建共享内存（`/dev/shm/vgpu_PID`），注册客户端
-4. Daemon 返回共享内存名称
-5. Shim mmap 共享内存
-6. 后续所有通信走共享内存（不再有 UDS 请求）
+`include/vgpu/protocol.h` 定义固定大小、cache-line 对齐的 `ShmChannel`：
 
-### 4.4 死亡检测
+- `state`：IDLE/PENDING/APPROVED/REJECTED。
+- `op`：ALLOC/FREE/KERNEL/MEMCPY request 或 completion。
+- `value`：分配或传输字节数。
+- `result`、`device`、`client_id`、`dying`：结果和生命周期元数据。
 
-- Daemon 保持每个客户端的 UDS 连接
-- 通过 epoll 检测 EPOLLHUP（客户端进程死亡）
-- 检测到死亡后：注销客户端、取消链接共享内存、释放配额
-- GPU 显存由 OS 自动回收
+发布请求和读取决策使用 release/acquire 顺序。协议目前是单槽，不支持同一客户端多个并行未决请求，因此客户端必须串行写通道。
 
-### 4.5 延迟释放（Deferred Unmap）
+## 7. CUDA 拦截与完成语义
 
-多线程环境下，poll 线程和 epoll 线程可能同时访问同一通道。解决方案：
+### 7.1 符号路由
 
-1. Epoll 线程检测到客户端死亡 → 设置 `dying` 标记 → 将通道指针置空
-2. Poll 线程看到 `dying` 标记 → 停止使用该通道
-3. Epoll 线程在释放锁后执行 munmap
+LD_PRELOAD 覆盖直接符号调用；shim 也接管 `dlsym` 和 `cuGetProcAddress*` 的目标符号路由。未调度的符号转给真实 Driver，以减小兼容面。
 
-这避免了 use-after-free，无需在持锁期间执行系统调用。
+| 类别 | 代表入口 | admission | completion |
+|---|---|---|---|
+| 显存 | `cuMemAlloc*`, `cuMemFree*` | 配额 | FREE 成功后上报；async free 优先 event |
+| Kernel | `cuLaunchKernel`, `cuLaunchKernelEx*` | kernel 槽位 | 常用 async 入口优先 event |
+| Copy | 常用 `cuMemcpy*`, peer, 2D/3D, batch v2 | memcpy 槽位 | async 优先 event，同步按返回 |
+| Set | 常用 `cuMemsetD*`, `cuMemsetD2D*` | memcpy 槽位 | async 优先 event，同步按返回 |
+| 其他 | device/context/module/多数 stream/event | 无 | 透传 |
 
-### 4.6 资源追踪
+### 7.2 异步完成观察
 
-Daemon 追踪每客户端状态：
+成功入队后，shim 在目标 stream 记录 `CU_EVENT_DISABLE_TIMING` 私有 event。后台线程周期性调用真实 `cuEventQuery`；完成后销毁 event 并向当前后端 report。若 event API 不可用或记录失败，立即 report 以避免后端计数永久泄漏。
 
-- **显存用量** — 注册时预扣 800MB context 开销
-- **活跃 kernel 数** — KERNEL_REQUEST 时加一，KERNEL_COMPLETE 时减一
+后端对象按进程生命周期保留，避免 ELF teardown 时完成线程上报到已析构对象。
 
-显存配额强制执行：如果客户端超限，daemon 拒绝请求，shim 返回 `CUDA_ERROR_OUT_OF_MEMORY`。
+## 8. 配额与一致性
 
-## 5. 符号拦截策略
+context overhead 是调度记账值，不等同于一次真实 CUDA allocation。显存 allocation 的指针和大小由 shim 记录，成功 free 后用原大小上报。daemon 客户端断开时删除整份客户端状态；真实 GPU 资源由 Driver/OS 的进程清理负责。
 
-`cuGetProcAddress` 是动态符号解析的入口。拦截策略：
+关键不变量：
 
-**需要调度逻辑的符号**（从 shim 返回）：
-- `cuMemAlloc` / `cuMemAlloc_v2` — 显存分配
-- `cuMemAllocAsync` / `cuMemAllocFromPoolAsync` — 异步显存分配
-- `cuMemFree` / `cuMemFree_v2` — 显存释放
-- `cuMemFreeAsync` — 异步显存释放
-- `cuMemcpy*`、`cuMemcpyPeer*`、`cuMemcpy2D*`、`cuMemcpy3D*`（含 `_v2` 与 Async）— memcpy 调度
-- `cuMemcpyBatchAsync_v2` — CUDA 13 pointer batch memcpy 调度
-- `cuMemsetD*` / `cuMemsetD2D*`（含 Async）— memset 调度，复用 memcpy 并发预算
-- `cuLaunchKernel` — kernel 启动
-- `cuLaunchKernelEx` / `cuLaunchKernelExC` — 新版 kernel 启动接口
-- `cuStreamCreate` / `cuStreamDestroy` / `cuStreamSynchronize` / `cuStreamQuery` — stream 操作
-- `cuGetProcAddress` / `cuGetProcAddress_v2` — 自身
+1. SHM 单槽在新请求前必须为 IDLE。
+2. allocation 审批不能溢出或超过配置 limit。
+3. active kernel/memcpy 计数不得为负。
+4. local 模式不得创建 socket。
+5. daemon 传输故障只能 warning 一次并保持 fail-open。
+6. completion 路径失败时必须回退上报，避免槽位永久占用。
 
-**其余符号**（默认从真实驱动返回）：
-- Context 操作（`cuCtxCreate`、`cuCtxSetCurrent` 等）
-- Device 操作（`cuDeviceGet`、`cuDeviceGetAttribute` 等）
-- Module 操作（`cuModuleLoad`、`cuModuleGetFunction` 等）
-- Event 操作（`cuEventCreate`、`cuEventRecord` 等；用户显式 event API 透传，shim 私有 event 仅用于完成观测）
-- 其他未纳入调度集合的 Driver API
+## 9. 配置语义
 
-LD_PRELOAD 确保直接调用走 shim 转发，`cuGetProcAddress` 确保动态解析走正确路径。
+公共资源配置由两种后端复用：
 
-### 5.1 接口覆盖矩阵
+- `GPU_SCHEDULER_MEM_LIMIT_MB`
+- `GPU_SCHEDULER_CONTEXT_OVERHEAD_MB`
+- `GPU_SCHEDULER_MAX_KERNELS`
+- `GPU_SCHEDULER_MAX_MEMCPY`
+- `GPU_SCHEDULER_VERBOSE`
 
-| 接口类别 | 代表 API | 处理方式 | 是否走 daemon | 备注 |
-|---|---|---|---|---|
-| 显存分配 | `cuMemAlloc*` | shim 拦截 | 是 | 受显存配额限制 |
-| 显存释放 | `cuMemFree*` | shim 拦截 | 是（报告） | 释放后更新统计 |
-| Kernel 启动 | `cuLaunchKernel*` | shim 拦截 | 是 | `cuLaunchKernel/cuLaunchKernelEx` 优先 event 完成；`ExC` 为 API-return |
-| Memcpy/Memset | `cuMemcpy*`、`cuMemcpyPeer*`、`cuMemcpy2D*`、`cuMemcpy3D*`（含 Async）、`cuMemcpyBatchAsync_v2`、`cuMemsetD*`/`cuMemsetD2D*` | shim 拦截 | 是 | Async 优先 event 完成；同步为 API-return；memset 复用 memcpy 并发预算；旧 Batch 与 3D Batch 暂不覆盖 |
-| Stream | `cuStream*` | shim 拦截 | 否 | 直接透传真实驱动 |
-| Event | `cuEvent*` | shim 拦截 | 否 | 直接透传真实驱动 |
-| 其余 Driver API | 如 `cuDevice*`、`cuModule*` | 转发真实驱动 | 否 | 维持兼容性优先 |
+通信专用：`GPU_SCHEDULER_SOCKET`、`GPU_SCHEDULER_WAIT_ITERS`、`GPU_SCHEDULER_POLL_US`。完成观察专用：`GPU_SCHEDULER_COMPLETION_POLL_US`。全部字段及默认值见 README。
 
-### 5.2 为什么默认不 hook dlopen
+## 10. 测试策略
 
-本项目默认不 hook `dlopen`，核心考虑是“兼容性优先 + 必要最小拦截”：
+- C++ 单元测试：local allocation 边界、阻塞/唤醒、completion 后计数归零。
+- 无 Torch 集成测试：daemon 启停、动态符号路由、fail-open、local OOM、Driver memset、并发客户端。
+- 可选 PyTorch 测试：daemon、local 和 fail-open 三种 GEMM 路径，以及 kernel/memcpy daemon 日志。
+- 性能测试：同一 GEMM 参数下无 shim 与启用 shim 的端到端 P95 A/B。
 
-1. `dlopen` 是进程级全局动态加载入口，hook 后容易影响非 CUDA 依赖库的加载语义。
-2. 对 `dlopen` 的拦截通常需要处理句柄一致性、引用计数、递归调用和符号可见性，复杂度与回归风险都较高。
-3. 当前主路径已可通过 `dlsym` 与 `cuGetProcAddress` 覆盖 CUDA Driver API 的常见解析流程，通常无需再扩大拦截面。
+## 11. 评估数据边界
 
-因此本设计将 `dlopen` hook 视为可选兜底策略，而不是默认路径。
+GreenCtx lifecycle、池化、policy 遍历以及 MPS/GreenCtx resident-memory 都是独立 workload 实验，已迁移到配套 CoGPU 仓库的 `eval/overhead/`。历史四组数据包含这些 workload 分量和旧 `VGPU_LOCAL_MODE=1` passthrough，不能作为纯拦截开销。
 
-### 5.3 当前拦截路径
+本仓库的纯拦截评估只允许在相同 GEMM、相同软件栈和相同同步边界下做无 shim/有 shim A/B；当前 LocalScheduler 需要据此重新测量，不能由历史混合数据推导。
 
-当前实现采用“符号解析入口拦截 + 目标符号拦截”的两层方式：
+## 12. 后续工程方向
 
-1. 框架加载 `libcuda.so.1`（通常由 `dlopen` 完成）。
-2. 框架通过 `dlsym` 查询 `cuGetProcAddress` / `cuGetProcAddress_v2`。
-3. shim 拦截该查询，返回 shim 自身的 `cuGetProcAddress*`。
-4. 后续解析具体符号时：
-  - 若符号属于调度集合（如 `cuMemAlloc*`、`cuLaunchKernel*`、`cuMemcpy*`），返回 shim 实现。
-  - 否则转发给真实驱动的 `cuGetProcAddress*` 返回真实函数指针。
-5. 被 shim 接管的重操作走共享内存审批；轻操作保持透传。
-
-这条路径实现了“只拦截必要符号、其余保持驱动原语义”的设计目标。
-
-## 6. cuGetExportTable
-
-默认转发到真实驱动。cuBLAS/cuDNN 需要真实的 export table 才能正常工作。
-
-可通过环境变量 `VGPU_CU_EXPORT_TABLE_SUCCESS_NULL=1` 返回空（调试用）。
-
-## 7. 优雅降级
-
-如果 daemon socket 不可达：
-- `connectToDaemon()` 返回 false
-- shim 向 stderr 打印一次明确 warning：调度不可用，进入 fail-open passthrough
-- `schedRequest()` 返回 true（批准）
-- 所有操作直接在真实驱动上执行
-
-系统在有/无 daemon 时核心功能保持可用——daemon 存在时增加审批逻辑，不可达时 fail-open 透传真实驱动。
-
-## 8. 配置
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `GPU_SCHEDULER_SOCKET` | `/tmp/vgpu_control.sock` | daemon socket 路径 |
-| `GPU_SCHEDULER_MEM_LIMIT_MB` | 无限制 | 每客户端显存上限 |
-| `GPU_SCHEDULER_CONTEXT_OVERHEAD_MB` | 800 | 预扣 context 开销 |
-| `GPU_SCHEDULER_MAX_KERNELS` | 1 | 全局并发 kernel 上限 |
-| `GPU_SCHEDULER_MAX_MEMCPY` | 0 | 全局并发 memcpy 上限（0=不限制） |
-| `GPU_SCHEDULER_POLL_US` | 100 | daemon 轮询间隔（μs） |
-| `GPU_SCHEDULER_COMPLETION_POLL_US` | 100 | shim 轮询私有 CUDA event 完成状态的间隔（μs） |
-| `GPU_SCHEDULER_WAIT_ITERS` | 200000 | shim 等待 daemon 响应的最大自旋迭代数 |
-| `GPU_SCHEDULER_VERBOSE` | 0 | 调度日志 |
-
-## 9. 已知局限
-
-### 9.1 无抢占式调度
-
-Daemon 只能在 kernel 启动前阻塞客户端。Kernel 一旦开始执行，daemon 无法中断。
-
-### 9.2 Memcpy 管控覆盖范围
-
-常见 `cuMemcpy*`、`cuMemcpyPeer*`、2D/3D 拷贝（含 Async）、CUDA 13 `cuMemcpyBatchAsync_v2` 与常见 `cuMemsetD*`/`cuMemsetD2D*` 会经过 daemon 审批，并可通过 `GPU_SCHEDULER_MAX_MEMCPY` 限制全局并发拷贝/写入数。旧 `cuMemcpyBatchAsync` 签名、`cuMemcpy3DBatchAsync*`、prefetch/discard 等仍未纳入管控。
-
-### 9.3 完成语义边界
-
-`cuLaunchKernel`、`cuLaunchKernelEx`、Async memcpy、Async memset 和 `cuMemFreeAsync` 优先基于私有 event 观测 stream 完成。event 路径不可用时回退 API-return；`cuLaunchKernelExC`、同步 memcpy/memset、同步显存释放等仍按 API-return/调用返回语义上报。
-
-### 9.4 单 GPU
-
-不支持多 GPU 调度或隔离。
-
-## 10. 设计亮点
-
-### 10.1 控制面与执行面分离
-
-- **控制面（daemon）**：只做审批、计数和限流，不执行 GPU API。
-- **执行面（shim + 真实驱动）**：真正发起 CUDA 调用，保证框架兼容性。
-
-这使得调度策略和 GPU 执行机制解耦，便于后续迭代策略（配额、优先级、抢占提示）而不破坏执行路径。
-
-### 10.2 双通路通信（握手慢路径 + 数据快路径）
-
-- **慢路径**：UDS 负责连接建立、生命周期管理、故障检测。
-- **快路径**：共享内存单生产者/单消费者协议，原子状态机完成审批交互。
-
-该设计兼顾了可管理性（UDS）与低时延（SHM）。
-
-### 10.3 失败优雅降级（Fail-Open）
-
-daemon 不可达时 shim 透传真实驱动，业务仍可运行。该模式优先保障可用性，适合线上灰度与增量部署。
-
-### 10.4 面向扩展的操作语义
-
-`SchedOp` 抽象了调度事件（ALLOC/KERNEL/MEMCPY），后续可自然扩展到 memcpy 带宽、图执行（CUDA Graph）和多设备策略。
-
-## 11. 正确性不变量
-
-以下不变量用于约束实现和测试：
-
-1. **状态机安全性**：请求完成后通道必须回到 `IDLE`，否则后续请求不得覆盖旧状态。
-2. **内存配额单调性**：审批前不得突破配额上限；释放路径不得使统计出现负值。
-3. **并发计数非负性**：`active_kernels`、`active_memcpy` 在任何时刻均应满足 $\ge 0$。
-4. **客户端死亡可回收性**：检测到断连后，必须清理客户端状态与共享内存映射。
-5. **降级可用性**：daemon 不可用时，核心 CUDA 路径仍应可运行。
-
-建议后续将这些不变量映射到自动化测试命名中，形成“性质-用例”一一对应关系。
-
-## 12. 评估方法（工程 + 学术）
-
-建议将实验拆分为三个维度：
-
-1. **性能开销**
-- 空载开销：只加载 shim、不启调度的基线延迟。
-- 调度开销：开启 daemon 后 `cuMemAlloc/cuLaunchKernel/cuMemcpy` 的新增时延。
-
-2. **隔离与公平性**
-- 多进程竞争下每个客户端的吞吐和尾延迟（P95/P99）。
-- 不同配额策略下的资源占用公平度（如 Jain 指数）。
-
-3. **鲁棒性**
-- daemon 异常退出/重启后的任务行为。
-- 客户端崩溃后的状态回收时延。
-
-可将结果统一报告为：吞吐、时延分位、拒绝率、恢复时间。
-
-## 13. 优化路线图
-
-### 13.1 短期（可快速落地）
-
-1. 扩展 event 完成观测到 `cuLaunchKernelExC`、CUDA Graph launch 和更多 stream-ordered 操作。
-2. 在确认版本 ABI 后扩展旧 Batch、3D Batch、prefetch/discard 等接口管控。
-3. 增加更细粒度日志开关（请求采样率、按 op 分类）。
-
-### 13.2 中期（增强策略能力）
-
-1. 引入 token-bucket 带宽调度，替代单纯并发数限制。
-2. 支持按客户端优先级和权重进行加权公平调度。
-3. 增加策略插件化接口，支持不同策略热切换。
-
-### 13.3 长期（体系能力）
-
-1. 多 GPU 拓扑感知调度（NUMA/NVLink 约束）。
-2. 与容器/runtime 集成（cgroup + device plugin）实现租户级隔离。
-3. 形成可复现实验基准套件，支撑论文与工程发布。
+1. daemon 侧引入等待队列和明确的超时/取消协议，代替瞬时拒绝。
+2. 按 device 分桶计数，并记录 allocation 所属 device/context。
+3. 覆盖 CUDA Graph、更多 batch/prefetch 和 `cuLaunchKernelExC` 的 event 完成路径。
+4. 增加 daemon 重启、客户端崩溃和长 kernel 的故障注入测试。
+5. 若要 fail-closed，新增显式配置和可观测的拒绝指标，不能复用当前 fail-open 语义。

@@ -1,6 +1,9 @@
 # vGPU configuration file (key=value)
 # Environment variables with the same key override these values.
 
+# Scheduling backend: daemon (cross-process) or local (in-process, no socket)
+VGPU_SCHEDULER_MODE=daemon
+
 GPU_SCHEDULER_SOCKET=/tmp/vgpu_control.sock
 GPU_SCHEDULER_MEM_LIMIT_MB=0
 GPU_SCHEDULER_CONTEXT_OVERHEAD_MB=800

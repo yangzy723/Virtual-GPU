@@ -7,13 +7,15 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+#include <chrono>
 #include <cstdarg>
 
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -21,6 +23,8 @@
 
 #include "scheduler.h"
 #include "vgpu/config.h"
+#include "vgpu/io.h"
+#include "vgpu/scheduler_config.h"
 #include "vgpu/protocol.h"
 
 static std::atomic<bool> g_stop{false};
@@ -43,7 +47,6 @@ static void log(const char* fmt, ...) {
 struct ClientInfo {
     int fd = -1;
     uint64_t client_id = 0;
-    std::string shm_name;
     vgpu::ShmChannel* channel = nullptr;
 };
 
@@ -85,35 +88,6 @@ static void destroyShm(uint64_t pid, vgpu::ShmChannel* channel) {
     }
     std::string name = shmNameForPid(pid);
     shm_unlink(name.c_str());
-}
-
-static bool readAll(int fd, void* buf, size_t len) {
-    auto* p = static_cast<uint8_t*>(buf);
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = read(fd, p + done, len - done);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            return false;
-        }
-        done += static_cast<size_t>(n);
-    }
-    return true;
-}
-
-static bool writeAll(int fd, const void* buf, size_t len) {
-    const auto* p = static_cast<const uint8_t*>(buf);
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = write(fd, p + done, len - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        done += static_cast<size_t>(n);
-    }
-    return true;
 }
 
 static int createListener(const std::string& path) {
@@ -198,7 +172,7 @@ static void handleClientDeath(ClientInfo& info) {
 
 static void handleHandshake(int client_fd) {
     vgpu::HandshakeRequest req{};
-    if (!readAll(client_fd, &req, sizeof(req))) {
+    if (!vgpu::io::readAll(client_fd, &req, sizeof(req))) {
         close(client_fd);
         return;
     }
@@ -209,28 +183,27 @@ static void handleHandshake(int client_fd) {
         auto* channel = createShm(req.client_id);
         if (!channel) {
             rsp.status = -1;
-            writeAll(client_fd, &rsp, sizeof(rsp));
+            vgpu::io::writeAll(client_fd, &rsp, sizeof(rsp));
             close(client_fd);
             return;
         }
 
         std::string shm_name = shmNameForPid(req.client_id);
 
-        g_scheduler->registerClient(req.client_id, shm_name);
+        g_scheduler->registerClient(req.client_id);
 
         {
             std::lock_guard<std::mutex> lock(g_clients_mu);
             ClientInfo info;
             info.fd = client_fd;
             info.client_id = req.client_id;
-            info.shm_name = shm_name;
             info.channel = channel;
             g_clients[client_fd] = info;
         }
 
         rsp.status = 0;
         std::strncpy(rsp.shm_name, shm_name.c_str(), sizeof(rsp.shm_name) - 1);
-        writeAll(client_fd, &rsp, sizeof(rsp));
+        vgpu::io::writeAll(client_fd, &rsp, sizeof(rsp));
 
         log("[scheduler] registered client pid %lu, shm=%s\n",
             static_cast<unsigned long>(req.client_id), shm_name.c_str());
@@ -245,51 +218,17 @@ static void handleHandshake(int client_fd) {
             }
         }
         rsp.status = 0;
-        writeAll(client_fd, &rsp, sizeof(rsp));
+        vgpu::io::writeAll(client_fd, &rsp, sizeof(rsp));
     }
 }
 
 int main() {
-    vgpu::Scheduler::Config cfg;
-
-    std::string mem_limit = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_MEM_LIMIT_MB");
-    if (!mem_limit.empty()) {
-        long mb = std::strtol(mem_limit.c_str(), nullptr, 10);
-        if (mb > 0) {
-            cfg.per_client_mem_limit = static_cast<size_t>(mb) * 1024 * 1024;
-        }
-    }
-
-    std::string overhead = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_CONTEXT_OVERHEAD_MB");
-    if (!overhead.empty()) {
-        long mb = std::strtol(overhead.c_str(), nullptr, 10);
-        if (mb > 0) {
-            cfg.context_overhead = static_cast<size_t>(mb) * 1024 * 1024;
-        }
-    }
-
-    std::string max_k = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_MAX_KERNELS");
-    if (!max_k.empty()) {
-        int val = std::atoi(max_k.c_str());
-        if (val > 0) cfg.max_concurrent_kernels = val;
-    }
-
-    std::string max_memcpy = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_MAX_MEMCPY");
-    if (!max_memcpy.empty()) {
-        int val = std::atoi(max_memcpy.c_str());
-        if (val >= 0) cfg.max_concurrent_memcpy = val;
-    }
-
-    std::string poll_us = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_POLL_US");
-    if (!poll_us.empty()) {
-        long val = std::strtol(poll_us.c_str(), nullptr, 10);
-        if (val > 0 && val <= 1000000) g_poll_interval_us = static_cast<int>(val);
-    }
-
+    const vgpu::SchedulerConfig config = vgpu::loadSchedulerConfig();
+    g_poll_interval_us = vgpu::config::getInt(
+        "GPU_SCHEDULER_POLL_US", 100, 1, 1000000);
     g_verbose = vgpu::config::getBool("GPU_SCHEDULER_VERBOSE", false);
 
-    vgpu::Scheduler sched(cfg);
-    sched.setVerbose(g_verbose);
+    vgpu::Scheduler sched(config, g_verbose);
     g_scheduler = &sched;
 
     std::string path = socketPath();
@@ -314,9 +253,9 @@ int main() {
 
     std::fprintf(stderr,
                  "[scheduler] listening on %s (max_kernels=%d, max_memcpy=%d, context_overhead=%zuMB, poll_us=%d)\n",
-                 path.c_str(), cfg.max_concurrent_kernels,
-                 cfg.max_concurrent_memcpy,
-                 cfg.context_overhead / (1024 * 1024), g_poll_interval_us);
+                 path.c_str(), config.max_concurrent_kernels,
+                 config.max_concurrent_memcpy,
+                 config.context_overhead_bytes / (1024 * 1024), g_poll_interval_us);
 
     constexpr int MAX_EVENTS = 64;
     std::vector<epoll_event> events(MAX_EVENTS);

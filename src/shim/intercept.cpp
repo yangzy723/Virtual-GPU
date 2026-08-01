@@ -1,19 +1,10 @@
 // intercept.cpp — libcuda.so shim (LD_PRELOAD)
 //
-// Intercepts CUDA Driver API calls for scheduling coordination.
-// Heavy ops (memory alloc, kernel launch) go through the daemon via shared
-// memory with atomic spin-wait. Light ops pass through to the real driver.
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <unistd.h>
+// Intercepts CUDA Driver API calls and delegates admission control to either
+// the in-process scheduler or the daemon transport. Light ops pass through.
 
 #include <atomic>
 #include <chrono>
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +22,7 @@
 #include "vgpu/cuda_abi.h"
 #include "vgpu/config.h"
 #include "vgpu/protocol.h"
+#include "scheduler_backend.h"
 
 // Trace logging — controlled by VGPU_TRACE env var (default: on)
 static bool g_trace = [] {
@@ -40,15 +32,6 @@ static bool g_trace = [] {
 #define TRACE(fmt, ...) do { \
     if (g_trace) std::fprintf(stderr, "[vGPU trace] " fmt "\n", ##__VA_ARGS__); \
 } while(0)
-
-// Portable spin-wait hint
-#if defined(__x86_64__) || defined(_M_X64)
-#define SPIN_PAUSE() __builtin_ia32_pause()
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#define SPIN_PAUSE() asm volatile("yield" ::: "memory")
-#else
-#define SPIN_PAUSE() ((void)0)
-#endif
 
 namespace vgpu {
 namespace {
@@ -107,12 +90,7 @@ T realSym(const char* name) {
     return reinterpret_cast<T>(sym);
 }
 
-// ── Shared memory channel ────────────────────────────────────────────────
-
-ShmChannel* g_channel = nullptr;
-std::mutex g_connect_mu;
-std::mutex g_sched_mu;
-std::atomic<bool> g_fail_open_warned{false};
+// ── Shim process state ───────────────────────────────────────────────────
 
 std::mutex g_alloc_mu;
 std::unordered_map<uint64_t, size_t> g_alloc_sizes;
@@ -180,257 +158,45 @@ uint64_t checkedElementBytes(size_t elements, size_t element_size) {
 }
 
 static int completionPollUs() {
-    static const int kDefaultPollUs = 100;
-    static const int kPollUs = [] {
-        std::string raw = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_COMPLETION_POLL_US");
-        if (raw.empty()) return kDefaultPollUs;
-
-        char* end = nullptr;
-        long parsed = std::strtol(raw.c_str(), &end, 10);
-        if (end == raw.c_str() || parsed <= 0) return kDefaultPollUs;
-        if (parsed > 1000000) return 1000000;
-        return static_cast<int>(parsed);
-    }();
-    return kPollUs;
-}
-
-std::string daemonSocketPath() {
-    return vgpu::config::getEnvOrConfig("GPU_SCHEDULER_SOCKET", defaultSocketPath());
-}
-
-void warnFailOpenOnce(const char* reason, const std::string& detail = "") {
-    bool already_warned = g_fail_open_warned.exchange(true, std::memory_order_acq_rel);
-    if (already_warned) return;
-
-    std::fprintf(stderr,
-                 "[vGPU warning] scheduler unavailable, fail-open passthrough to real CUDA driver: %s",
-                 reason);
-    if (!detail.empty()) {
-        std::fprintf(stderr, " (%s)", detail.c_str());
-    }
-    std::fprintf(stderr, "\n");
-}
-
-bool connectToDaemon() {
-    if (g_channel) return true;
-    std::lock_guard<std::mutex> lock(g_connect_mu);
-    if (g_channel) return true;
-
-    std::string path = daemonSocketPath();
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        warnFailOpenOnce("socket() failed", std::strerror(errno));
-        return false;
-    }
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (path.size() >= sizeof(addr.sun_path)) {
-        close(fd);
-        warnFailOpenOnce("daemon socket path is too long", path);
-        return false;
-    }
-    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        std::string detail = path + ": " + std::strerror(errno);
-        close(fd);
-        warnFailOpenOnce("cannot connect to daemon", detail);
-        return false;
-    }
-
-    HandshakeRequest req{};
-    req.op = static_cast<uint32_t>(HandshakeOp::HELLO);
-    req.client_id = static_cast<uint64_t>(getpid());
-
-    auto writeAll = [](int out_fd, const void* buf, size_t len) {
-        const auto* p = static_cast<const uint8_t*>(buf);
-        size_t done = 0;
-        while (done < len) {
-            ssize_t n = write(out_fd, p + done, len - done);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            if (n == 0) return false;
-            done += static_cast<size_t>(n);
-        }
-        return true;
-    };
-
-    auto readAll = [](int in_fd, void* buf, size_t len) {
-        auto* p = static_cast<uint8_t*>(buf);
-        size_t done = 0;
-        while (done < len) {
-            ssize_t n = read(in_fd, p + done, len - done);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR) continue;
-                return false;
-            }
-            done += static_cast<size_t>(n);
-        }
-        return true;
-    };
-
-    if (!writeAll(fd, &req, sizeof(req))) {
-        close(fd);
-        warnFailOpenOnce("daemon handshake write failed", path);
-        return false;
-    }
-
-    HandshakeResponse rsp{};
-    if (!readAll(fd, &rsp, sizeof(rsp)) || rsp.status != 0) {
-        close(fd);
-        warnFailOpenOnce("daemon handshake read/status failed", path);
-        return false;
-    }
-
-    int shm_fd = shm_open(rsp.shm_name, O_RDWR, 0666);
-    if (shm_fd < 0) {
-        close(fd);
-        warnFailOpenOnce("shared-memory open failed", rsp.shm_name);
-        return false;
-    }
-
-    g_channel = static_cast<ShmChannel*>(
-        mmap(nullptr, sizeof(ShmChannel), PROT_READ | PROT_WRITE,
-             MAP_SHARED, shm_fd, 0));
-    close(shm_fd);
-
-    if (g_channel == MAP_FAILED) {
-        g_channel = nullptr;
-        close(fd);
-        warnFailOpenOnce("shared-memory mmap failed", rsp.shm_name);
-        return false;
-    }
-
-    return true;
-}
-
-bool ensureConnected() {
-    if (g_channel) return true;
-    return connectToDaemon();
+    static const int poll_us = vgpu::config::getInt(
+        "GPU_SCHEDULER_COMPLETION_POLL_US", 100, 1, 1000000);
+    return poll_us;
 }
 
 // ── Scheduling helpers ───────────────────────────────────────────────────
 
 thread_local int g_current_device = 0;
 
-static int waitIterations() {
-    static const int kDefaultIters = 200000;
-    static const int kIters = [] {
-        std::string raw = vgpu::config::getEnvOrConfig("GPU_SCHEDULER_WAIT_ITERS");
-        if (raw.empty()) return kDefaultIters;
-
-        char* end = nullptr;
-        long parsed = std::strtol(raw.c_str(), &end, 10);
-        if (end == raw.c_str() || parsed <= 0) return kDefaultIters;
-        if (parsed > 5000000) return 5000000;
-        return static_cast<int>(parsed);
-    }();
-    return kIters;
-}
-
-static SchedState waitForDecision(int max_iters) {
-    if (!g_channel) return SchedState::REJECTED;
-    for (int i = 0; i < max_iters; i++) {
-        auto state = static_cast<SchedState>(
-            g_channel->state.load(std::memory_order_acquire));
-        if (state == SchedState::APPROVED || state == SchedState::REJECTED) {
-            return state;
-        }
-        if (i < 1000) SPIN_PAUSE();
-        else std::this_thread::yield();
-    }
-    return SchedState::PENDING;
-}
-
-static bool waitForIdle(int max_iters) {
-    if (!g_channel) return false;
-    for (int i = 0; i < max_iters; i++) {
-        auto state = static_cast<SchedState>(
-            g_channel->state.load(std::memory_order_acquire));
-        if (state == SchedState::IDLE) return true;
-        if (i < 1000) SPIN_PAUSE();
-        else std::this_thread::yield();
-    }
-    return false;
-}
-
 bool schedRequest(SchedOp op, uint64_t value, int device) {
-    if (!ensureConnected()) return true;
-    std::lock_guard<std::mutex> lock(g_sched_mu);
-    if (!waitForIdle(waitIterations())) {
-        warnFailOpenOnce("shared-memory channel did not become IDLE before request");
-        return true;
-    }
-
-    TRACE("daemon request op=%u value=%llu device=%d",
-          static_cast<unsigned int>(op),
-          static_cast<unsigned long long>(value), device);
-
-    g_channel->device = static_cast<uint32_t>(device);
-    g_channel->client_id = static_cast<uint64_t>(getpid());
-    g_channel->value.store(value, std::memory_order_relaxed);
-    g_channel->op.store(static_cast<uint32_t>(op), std::memory_order_relaxed);
-    g_channel->state.store(static_cast<uint32_t>(SchedState::PENDING),
-                           std::memory_order_release);
-
-    auto decision = waitForDecision(waitIterations());
-    if (decision == SchedState::APPROVED) {
-        g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
-                               std::memory_order_release);
-        TRACE("daemon approved op=%u", static_cast<unsigned int>(op));
-        return true;
-    }
-    if (decision == SchedState::REJECTED) {
-        g_channel->state.store(static_cast<uint32_t>(SchedState::IDLE),
-                               std::memory_order_release);
-        TRACE("daemon rejected op=%u", static_cast<unsigned int>(op));
-        return false;
-    }
-
-    TRACE("daemon request timeout, bypass op=%u", static_cast<unsigned int>(op));
-    warnFailOpenOnce("daemon decision timeout");
-    return true;
+    return schedulerRequest(op, value, device);
 }
 
 void schedReport(SchedOp op, uint64_t value, int device) {
-    if (!ensureConnected()) return;
-    std::lock_guard<std::mutex> lock(g_sched_mu);
-    if (!waitForIdle(waitIterations())) {
-        warnFailOpenOnce("shared-memory channel did not become IDLE before report");
+    schedulerReport(op, value, device);
+}
+
+void finishAllocationAdmission(CUresult result, CUdeviceptr* dptr,
+                               size_t bytesize, int device) {
+    if (result == CUDA_SUCCESS && dptr) {
+        std::lock_guard<std::mutex> lock(g_alloc_mu);
+        g_alloc_sizes[*dptr] = bytesize;
         return;
     }
-
-    TRACE("daemon report op=%u value=%llu device=%d",
-          static_cast<unsigned int>(op),
-          static_cast<unsigned long long>(value), device);
-
-    g_channel->device = static_cast<uint32_t>(device);
-    g_channel->client_id = static_cast<uint64_t>(getpid());
-    g_channel->value.store(value, std::memory_order_relaxed);
-    g_channel->op.store(static_cast<uint32_t>(op), std::memory_order_relaxed);
-    g_channel->state.store(static_cast<uint32_t>(SchedState::PENDING),
-                           std::memory_order_release);
-
-    if (waitForIdle(waitIterations())) {
-        TRACE("daemon report done op=%u", static_cast<unsigned int>(op));
-        return;
-    }
-
-    TRACE("daemon report timeout op=%u", static_cast<unsigned int>(op));
-    warnFailOpenOnce("daemon report timeout");
+    // Admission is accounted before the real driver call. Roll it back when
+    // the driver rejects the allocation so quotas cannot leak permanently.
+    schedReport(SchedOp::FREE, bytesize, device);
 }
 
 void completionWorker() {
+    const auto query = realSym<CUresult(*)(CUevent)>("cuEventQuery");
+    auto destroy = realSym<CUresult(*)(CUevent)>("cuEventDestroy_v2");
+    if (!destroy) destroy = realSym<CUresult(*)(CUevent)>("cuEventDestroy");
+
     while (!g_completion_stop.load(std::memory_order_acquire)) {
         std::vector<PendingCompletion> completed;
 
         {
             std::lock_guard<std::mutex> lock(g_completion_mu);
-            auto query = realSym<CUresult(*)(CUevent)>("cuEventQuery");
             if (query) {
                 size_t write_index = 0;
                 for (size_t read_index = 0; read_index < g_pending_completions.size(); ++read_index) {
@@ -446,8 +212,6 @@ void completionWorker() {
             }
         }
 
-        auto destroy = realSym<CUresult(*)(CUevent)>("cuEventDestroy_v2");
-        if (!destroy) destroy = realSym<CUresult(*)(CUevent)>("cuEventDestroy");
         for (const auto& item : completed) {
             if (destroy) destroy(item.event);
             schedReport(item.op, item.value, item.device);
@@ -692,8 +456,8 @@ void* dlsym(void* handle, const char* symbol) {
         return vgpu::g_real_dlsym(handle, symbol);
     }
 
-    if (symbol && (std::strcmp(symbol, "cuGetProcAddress") == 0 ||
-                   std::strcmp(symbol, "cuGetProcAddress_v2") == 0)) {
+    if (std::strcmp(symbol, "cuGetProcAddress") == 0 ||
+                   std::strcmp(symbol, "cuGetProcAddress_v2") == 0) {
         void* fn = vgpu::g_real_dlsym(RTLD_DEFAULT, symbol);
         if (fn) return fn;
     }
@@ -705,6 +469,8 @@ void* dlsym(void* handle, const char* symbol) {
 
 extern "C" {
 
+CUresult cuGetProcAddress(const char* symbol, void** pfn,
+                          int cudaVersion, unsigned long long flags);
 CUresult cuGetProcAddress_v2(const char* symbol, void** pfn,
                              int cudaVersion, unsigned long long flags,
                              unsigned long long* symbolStatus);
@@ -882,7 +648,7 @@ CUresult cuModuleUnload(CUmodule hmod) {
     return real(hmod);
 }
 
-// Memory — scheduled through daemon
+// Memory — scheduled through the selected backend
 
 CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
     TRACE("cuMemAlloc(bytesize=%zu)", bytesize);
@@ -895,10 +661,8 @@ CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
     }
 
     CUresult err = real(dptr, bytesize);
-    if (err == CUDA_SUCCESS && dptr) {
-        std::lock_guard<std::mutex> lock(vgpu::g_alloc_mu);
-        vgpu::g_alloc_sizes[*dptr] = bytesize;
-    }
+    vgpu::finishAllocationAdmission(
+        err, dptr, bytesize, vgpu::g_current_device);
     return err;
 }
 
@@ -959,10 +723,8 @@ CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream hStream) {
     }
 
     CUresult err = real(dptr, bytesize, hStream);
-    if (err == CUDA_SUCCESS && dptr) {
-        std::lock_guard<std::mutex> lock(vgpu::g_alloc_mu);
-        vgpu::g_alloc_sizes[*dptr] = bytesize;
-    }
+    vgpu::finishAllocationAdmission(
+        err, dptr, bytesize, vgpu::g_current_device);
     return err;
 }
 
@@ -981,10 +743,8 @@ CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize,
     }
 
     CUresult err = real(dptr, bytesize, pool, hStream);
-    if (err == CUDA_SUCCESS && dptr) {
-        std::lock_guard<std::mutex> lock(vgpu::g_alloc_mu);
-        vgpu::g_alloc_sizes[*dptr] = bytesize;
-    }
+    vgpu::finishAllocationAdmission(
+        err, dptr, bytesize, vgpu::g_current_device);
     return err;
 }
 
@@ -1018,7 +778,7 @@ CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
     return err;
 }
 
-// Memcpy — scheduled through daemon
+// Memcpy — scheduled through the selected backend
 
 CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t bytesize) {
     TRACE("cuMemcpy(dst=0x%llx, src=0x%llx, bytesize=%zu)",
@@ -1351,7 +1111,7 @@ CUresult cuMemcpyBatchAsync_v2(CUdeviceptr* dsts, CUdeviceptr* srcs, size_t* siz
                                                          attrs, attrsIdxs, numAttrs, hStream); });
 }
 
-// Memset — scheduled through daemon as memory-write work
+// Memset — scheduled through the selected backend as memory-write work
 
 CUresult cuMemsetD8(CUdeviceptr dst, unsigned char value, size_t count) {
     TRACE("cuMemsetD8(dst=0x%llx, value=%u, count=%zu)", (unsigned long long)dst, value, count);
@@ -1461,7 +1221,7 @@ CUresult cuMemsetD2D32Async(CUdeviceptr dst, size_t dstPitch, unsigned int value
                                   dst, dstPitch, value, width, height, 4, hStream);
 }
 
-// Kernel launch — scheduled through daemon
+// Kernel launch — scheduled through the selected backend
 
 CUresult cuLaunchKernel(CUfunction f,
                         unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -1490,7 +1250,7 @@ CUresult cuLaunchKernel(CUfunction f,
 
 CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f,
                          void** kernelParams, void** extra) {
-    TRACE("cuLaunchKernelEx(config=%p, f=%p)", config, (void*)f);
+    TRACE("cuLaunchKernelEx(config=%p, f=%p)", (const void*)config, (void*)f);
     auto real = vgpu::realSym<CUresult(*)(const CUlaunchConfig*, CUfunction, void**, void**)>(
         "cuLaunchKernelEx");
     if (!real) return CUDA_ERROR_NOT_SUPPORTED;
@@ -1592,6 +1352,24 @@ CUresult cuEventQuery(CUevent hEvent) {
     return real(hEvent);
 }
 
+static bool resolveShimProcAddress(const char* symbol, void** function,
+                                   int cuda_version,
+                                   unsigned long long* status) {
+    void* resolved = nullptr;
+    if (std::strcmp(symbol, "cuGetProcAddress") == 0) {
+        resolved = reinterpret_cast<void*>(cuGetProcAddress);
+    } else if (std::strcmp(symbol, "cuGetProcAddress_v2") == 0) {
+        resolved = reinterpret_cast<void*>(cuGetProcAddress_v2);
+    } else if (vgpu::shouldRouteProcAddressToShim(symbol, cuda_version)) {
+        resolved = dlsym(RTLD_DEFAULT, symbol);
+    }
+
+    if (!resolved) return false;
+    *function = resolved;
+    if (status) *status = 0;
+    return true;
+}
+
 // cuGetProcAddress — dynamic symbol resolution routing
 
 CUresult cuGetProcAddress(const char* symbol, void** pfn,
@@ -1599,18 +1377,8 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn,
     TRACE("cuGetProcAddress(symbol=%s, version=%d)", symbol ? symbol : "null", cudaVersion);
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
-    if (std::strcmp(symbol, "cuGetProcAddress") == 0) {
-        *pfn = reinterpret_cast<void*>(cuGetProcAddress);
+    if (resolveShimProcAddress(symbol, pfn, cudaVersion, nullptr)) {
         return CUDA_SUCCESS;
-    }
-    if (std::strcmp(symbol, "cuGetProcAddress_v2") == 0) {
-        *pfn = reinterpret_cast<void*>(cuGetProcAddress_v2);
-        return CUDA_SUCCESS;
-    }
-
-    if (vgpu::shouldRouteProcAddressToShim(symbol, cudaVersion)) {
-        void* fn = dlsym(RTLD_DEFAULT, symbol);
-        if (fn) { *pfn = fn; return CUDA_SUCCESS; }
     }
 
     using RealGetProcAddressFn = CUresult(*)(const char*, void**, int, unsigned long long);
@@ -1630,24 +1398,8 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn,
     TRACE("cuGetProcAddress_v2(symbol=%s, version=%d)", symbol ? symbol : "null", cudaVersion);
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
 
-    if (std::strcmp(symbol, "cuGetProcAddress") == 0) {
-        *pfn = reinterpret_cast<void*>(cuGetProcAddress);
-        if (symbolStatus) *symbolStatus = 0ull;
+    if (resolveShimProcAddress(symbol, pfn, cudaVersion, symbolStatus)) {
         return CUDA_SUCCESS;
-    }
-    if (std::strcmp(symbol, "cuGetProcAddress_v2") == 0) {
-        *pfn = reinterpret_cast<void*>(cuGetProcAddress_v2);
-        if (symbolStatus) *symbolStatus = 0ull;
-        return CUDA_SUCCESS;
-    }
-
-    if (vgpu::shouldRouteProcAddressToShim(symbol, cudaVersion)) {
-        void* fn = dlsym(RTLD_DEFAULT, symbol);
-        if (fn) {
-            *pfn = fn;
-            if (symbolStatus) *symbolStatus = 0ull;
-            return CUDA_SUCCESS;
-        }
     }
 
     using RealGetProcAddressV2Fn = CUresult(*)(const char*, void**, int, unsigned long long,

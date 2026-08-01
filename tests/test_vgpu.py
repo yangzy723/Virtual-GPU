@@ -251,6 +251,62 @@ class TestDaemonBasic(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"Graceful degradation failed:\n{combined}")
         self.assertIn("TORCH_TEST_PASSED", combined)
 
+    def test_torch_matmul_with_local_scheduler(self):
+        """Local mode schedules in-process and never attempts daemon transport."""
+        _require_env()
+        sock = Path("/tmp/vgpu_test_local_mode_must_not_exist.sock")
+        if sock.exists():
+            sock.unlink()
+
+        result = _run_with_shim(
+            TORCH_SCRIPT,
+            sock,
+            timeout=120,
+            extra_env={
+                "VGPU_SCHEDULER_MODE": "local",
+                "GPU_SCHEDULER_MAX_KERNELS": "8",
+                "GPU_SCHEDULER_VERBOSE": "1",
+                "VGPU_TRACE": "0",
+            },
+        )
+        combined = result.stdout + result.stderr
+        if "SKIP:" in combined:
+            self.skipTest(combined.split("SKIP:")[1].strip())
+        self.assertEqual(result.returncode, 0, f"Local scheduler failed:\n{combined}")
+        self.assertIn("TORCH_TEST_PASSED", combined)
+        self.assertIn("[vGPU scheduler] mode=local", result.stderr)
+        self.assertNotIn("scheduler unavailable", result.stderr)
+
+    def test_local_scheduler_enforces_memory_quota_without_daemon(self):
+        """Local allocation admission is real and does not use daemon fail-open."""
+        _require_env()
+        sock = Path("/tmp/vgpu_test_local_quota_must_not_exist.sock")
+        if sock.exists():
+            sock.unlink()
+        script = """
+import ctypes
+shim = ctypes.CDLL("build/libcuda.so")
+shim.cuMemAlloc.argtypes = [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_size_t]
+shim.cuMemAlloc.restype = ctypes.c_int
+ptr = ctypes.c_ulonglong()
+rc = shim.cuMemAlloc(ctypes.byref(ptr), 2 * 1024 * 1024)
+print(f"LOCAL_QUOTA_RC={rc}")
+assert rc == 2, f"expected CUDA_ERROR_OUT_OF_MEMORY (2), got {rc}"
+"""
+        result = _run_with_shim(
+            script, sock, timeout=30,
+            extra_env={
+                "VGPU_SCHEDULER_MODE": "local",
+                "GPU_SCHEDULER_MEM_LIMIT_MB": "1",
+                "GPU_SCHEDULER_CONTEXT_OVERHEAD_MB": "0",
+                "VGPU_TRACE": "0",
+            },
+        )
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, f"Local quota test failed:\n{combined}")
+        self.assertIn("LOCAL_QUOTA_RC=2", result.stdout)
+        self.assertNotIn("scheduler unavailable", result.stderr)
+
     def test_fail_open_without_daemon_prints_warning(self):
         """Fail-open passthrough must be visible when the daemon is unavailable."""
         _require_env()
